@@ -184,45 +184,97 @@ def create_auth_user(email: str, password: str):
     except Exception:
         pass
 
+
     attempt_text = "; ".join([f"{k}: {v}" for k, v in attempts])
     return False, f"All sign_up attempts failed. Attempts: {attempt_text}"
 
 def upload_id_image_to_storage(uploaded_file, path: str):
     """
-    Upload bytes to Supabase Storage bucket at given path.
-    Returns (ok: bool, public_url_or_error_str)
+    Robust upload helper for Supabase Storage.
+    Tries multiple upload call shapes and normalizes responses (UploadResponse, dict, etc).
+    Returns (ok: bool, public_url_or_error_str).
     """
+    attempts = []
     try:
         file_bytes = uploaded_file.getvalue()
-        # Try bytes upload; if client complains, try file-like
-        try:
-            res = supabase.storage.from_(BUCKET_NAME).upload(path, file_bytes)
-        except Exception:
-            file_obj = io.BytesIO(file_bytes)
-            res = supabase.storage.from_(BUCKET_NAME).upload(path, file_obj)
-
-        ok, data, err = _parse_supabase_response(res)
-        if not ok:
-            # we continue to attempt to get a public url; but if upload failed, return error
-            return False, f"Upload failed: {err}"
-
-        # Get public URL (works if bucket is public)
-        try:
-            url_res = supabase.storage.from_(BUCKET_NAME).get_public_url(path)
-            ok2, data2, err2 = _parse_supabase_response(url_res)
-            if ok2:
-                # data2 may be a dict or string
-                if isinstance(data2, dict):
-                    return True, data2.get("publicUrl") or data2.get("publicURL") or data2.get("public_url") or str(data2)
-                return True, str(data2)
-            else:
-                return False, f"Failed to get public URL: {err2 or data2}"
-        except Exception as e:
-            return False, f"Exception when getting public URL: {e}"
-
     except Exception as e:
-        return False, f"Exception uploading file: {e}"
+        return False, f"Could not read uploaded file bytes: {e}"
 
+    # Prepare a guessed content type if available
+    content_type = None
+    try:
+        if hasattr(uploaded_file, "type") and uploaded_file.type:
+            content_type = uploaded_file.type
+        elif hasattr(uploaded_file, "name") and uploaded_file.name.lower().endswith(".png"):
+            content_type = "image/png"
+        elif hasattr(uploaded_file, "name") and uploaded_file.name.lower().endswith(".jpg"):
+            content_type = "image/jpeg"
+        elif hasattr(uploaded_file, "name") and uploaded_file.name.lower().endswith(".jpeg"):
+            content_type = "image/jpeg"
+    except Exception:
+        content_type = None
+
+    # Try several upload call signatures that appear across supabase client versions
+    upload_calls = [
+        # (callable, description)
+        (lambda: supabase.storage.from_(BUCKET_NAME).upload(path, file_bytes, content_type=content_type, upsert=True),
+         "bytes + content_type + upsert"),
+        (lambda: supabase.storage.from_(BUCKET_NAME).upload(path, file_bytes, upsert=True),
+         "bytes + upsert"),
+        (lambda: supabase.storage.from_(BUCKET_NAME).upload(path, io.BytesIO(file_bytes), content_type=content_type),
+         "file-like + content_type"),
+        (lambda: supabase.storage.from_(BUCKET_NAME).upload(path, io.BytesIO(file_bytes), upsert=True),
+         "file-like + upsert"),
+        # Some clients expect dict metadata param — try a generic form
+        (lambda: supabase.storage.from_(BUCKET_NAME).upload(path, file_bytes, {"content-type": content_type} if content_type else None),
+         "bytes + metadata-dict"),
+    ]
+
+    last_res = None
+    for call_fn, desc in upload_calls:
+        try:
+            res = call_fn()
+            last_res = res
+            # Use your existing parser to check success
+            ok, data, err = _parse_supabase_response(res)
+            attempts.append((desc, "parsed_ok" if ok else f"parsed_err: {err}"))
+            if ok:
+                # success: try to get public url and return it
+                try:
+                    url_res = supabase.storage.from_(BUCKET_NAME).get_public_url(path)
+                    ok2, data2, err2 = _parse_supabase_response(url_res)
+                    if ok2:
+                        # data2 might be dict or string
+                        if isinstance(data2, dict):
+                            public = data2.get("publicUrl") or data2.get("publicURL") or data2.get("public_url") or str(data2)
+                        else:
+                            public = str(data2)
+                        return True, public
+                    else:
+                        # If get_public_url failed, still return whatever upload returned as success info
+                        return True, f"Upload succeeded but failed to get public url: {err2 or data2}"
+                except Exception as e:
+                    return True, f"Upload succeeded but exception getting public URL: {e}"
+            # else continue trying other call shapes
+        except Exception as e:
+            # capture the exception text for debugging and continue
+            attempts.append((desc, f"exception: {e}"))
+            continue
+
+    # If we reach here, all upload attempts failed
+    # Provide a helpful error including last response repr if available
+    debug_last = ""
+    try:
+        if last_res is not None:
+            debug_last = repr(last_res)
+    except Exception:
+        debug_last = "<could not repr last_res>"
+
+    # Build an attempts summary for diagnostics
+    attempt_text = "; ".join([f"{k}: {v}" for k, v in attempts])
+    error_msg = f"Upload failed. Attempts: {attempt_text}. Last response repr: {debug_last}"
+
+    return False, error_msg
 
 def save_metadata_to_table(email: str, auth_user_id: str, is_adult: bool, image_path: str, image_url: str):
     payload = {
