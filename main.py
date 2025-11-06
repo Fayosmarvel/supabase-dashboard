@@ -190,8 +190,7 @@ def create_auth_user(email: str, password: str):
 
 def upload_id_image_to_storage(uploaded_file, path: str):
     """
-    Robust upload helper for Supabase Storage.
-    Tries multiple upload call shapes and normalizes responses (UploadResponse, dict, etc).
+    Robust upload helper for Supabase Storage that understands UploadResponse objects.
     Returns (ok: bool, public_url_or_error_str).
     """
     attempts = []
@@ -200,34 +199,10 @@ def upload_id_image_to_storage(uploaded_file, path: str):
     except Exception as e:
         return False, f"Could not read uploaded file bytes: {e}"
 
-    # Prepare a guessed content type if available
-    content_type = None
-    try:
-        if hasattr(uploaded_file, "type") and uploaded_file.type:
-            content_type = uploaded_file.type
-        elif hasattr(uploaded_file, "name") and uploaded_file.name.lower().endswith(".png"):
-            content_type = "image/png"
-        elif hasattr(uploaded_file, "name") and uploaded_file.name.lower().endswith(".jpg"):
-            content_type = "image/jpeg"
-        elif hasattr(uploaded_file, "name") and uploaded_file.name.lower().endswith(".jpeg"):
-            content_type = "image/jpeg"
-    except Exception:
-        content_type = None
-
-    # Try several upload call signatures that appear across supabase client versions
+    # Try the simplest/most compatible upload calls (do NOT pass unsupported kwargs)
     upload_calls = [
-        # (callable, description)
-        (lambda: supabase.storage.from_(BUCKET_NAME).upload(path, file_bytes, content_type=content_type, upsert=True),
-         "bytes + content_type + upsert"),
-        (lambda: supabase.storage.from_(BUCKET_NAME).upload(path, file_bytes, upsert=True),
-         "bytes + upsert"),
-        (lambda: supabase.storage.from_(BUCKET_NAME).upload(path, io.BytesIO(file_bytes), content_type=content_type),
-         "file-like + content_type"),
-        (lambda: supabase.storage.from_(BUCKET_NAME).upload(path, io.BytesIO(file_bytes), upsert=True),
-         "file-like + upsert"),
-        # Some clients expect dict metadata param — try a generic form
-        (lambda: supabase.storage.from_(BUCKET_NAME).upload(path, file_bytes, {"content-type": content_type} if content_type else None),
-         "bytes + metadata-dict"),
+        (lambda: supabase.storage.from_(BUCKET_NAME).upload(path, file_bytes), "bytes"),
+        (lambda: supabase.storage.from_(BUCKET_NAME).upload(path, io.BytesIO(file_bytes)), "file-like"),
     ]
 
     last_res = None
@@ -235,34 +210,80 @@ def upload_id_image_to_storage(uploaded_file, path: str):
         try:
             res = call_fn()
             last_res = res
-            # Use your existing parser to check success
+            # If res is an UploadResponse-like object, treat as success
+            # Try to extract path (path inside bucket) from common attributes
+            inner_path = None
+            try:
+                if hasattr(res, "path") and getattr(res, "path"):
+                    inner_path = getattr(res, "path")
+                elif hasattr(res, "full_path") and getattr(res, "full_path"):
+                    # some clients include bucket prefix; strip bucket if present
+                    fp = getattr(res, "full_path")
+                    # if full_path starts with "<bucket_name>/", remove that prefix
+                    prefix = f"{BUCKET_NAME}/"
+                    if isinstance(fp, str) and fp.startswith(prefix):
+                        inner_path = fp[len(prefix):]
+                    else:
+                        inner_path = fp
+                elif hasattr(res, "fullPath") and getattr(res, "fullPath"):
+                    fp = getattr(res, "fullPath")
+                    prefix = f"{BUCKET_NAME}/"
+                    if isinstance(fp, str) and fp.startswith(prefix):
+                        inner_path = fp[len(prefix):]
+                    else:
+                        inner_path = fp
+            except Exception:
+                inner_path = None
+
+            # If inner_path found, we can get the public URL
+            if inner_path:
+                try:
+                    url_res = supabase.storage.from_(BUCKET_NAME).get_public_url(inner_path)
+                    ok2, data2, err2 = _parse_supabase_response(url_res)
+                    if ok2:
+                        if isinstance(data2, dict):
+                            return True, data2.get("publicUrl") or data2.get("publicURL") or data2.get("public_url") or str(data2)
+                        return True, str(data2)
+                    else:
+                        # upload succeeded, but get_public_url returned something unexpected
+                        return True, f"Upload succeeded; could not obtain public URL: {err2 or data2}"
+                except Exception as e:
+                    return True, f"Upload succeeded; exception obtaining public URL: {e}"
+
+            # If res is a dict-like and parser says ok, attempt to locate path inside it
             ok, data, err = _parse_supabase_response(res)
             attempts.append((desc, "parsed_ok" if ok else f"parsed_err: {err}"))
             if ok:
-                # success: try to get public url and return it
+                # Try to extract path from data if possible
                 try:
-                    url_res = supabase.storage.from_(BUCKET_NAME).get_public_url(path)
-                    ok2, data2, err2 = _parse_supabase_response(url_res)
-                    if ok2:
-                        # data2 might be dict or string
-                        if isinstance(data2, dict):
-                            public = data2.get("publicUrl") or data2.get("publicURL") or data2.get("public_url") or str(data2)
+                    # Common locations: data['path'] or data.get('Key') etc.
+                    p = None
+                    if isinstance(data, dict):
+                        p = data.get("path") or data.get("full_path") or data.get("fullPath") or data.get("key")
+                    if p:
+                        # strip bucket prefix if present
+                        prefix = f"{BUCKET_NAME}/"
+                        if isinstance(p, str) and p.startswith(prefix):
+                            p = p[len(prefix):]
+                        url_res = supabase.storage.from_(BUCKET_NAME).get_public_url(p)
+                        ok2, data2, err2 = _parse_supabase_response(url_res)
+                        if ok2:
+                            if isinstance(data2, dict):
+                                return True, data2.get("publicUrl") or data2.get("publicURL") or data2.get("public_url") or str(data2)
+                            return True, str(data2)
                         else:
-                            public = str(data2)
-                        return True, public
+                            return True, f"Upload succeeded; get_public_url failed: {err2 or data2}"
                     else:
-                        # If get_public_url failed, still return whatever upload returned as success info
-                        return True, f"Upload succeeded but failed to get public url: {err2 or data2}"
+                        # upload probably succeeded but we couldn't find path; return success with raw data
+                        return True, f"Upload seemed to succeed. Response: {data}"
                 except Exception as e:
-                    return True, f"Upload succeeded but exception getting public URL: {e}"
-            # else continue trying other call shapes
+                    return True, f"Upload seemed to succeed; exception processing response: {e}"
+
         except Exception as e:
-            # capture the exception text for debugging and continue
             attempts.append((desc, f"exception: {e}"))
             continue
 
-    # If we reach here, all upload attempts failed
-    # Provide a helpful error including last response repr if available
+    # All attempts failed — present a helpful diagnostic including last response repr
     debug_last = ""
     try:
         if last_res is not None:
@@ -270,10 +291,8 @@ def upload_id_image_to_storage(uploaded_file, path: str):
     except Exception:
         debug_last = "<could not repr last_res>"
 
-    # Build an attempts summary for diagnostics
     attempt_text = "; ".join([f"{k}: {v}" for k, v in attempts])
     error_msg = f"Upload failed. Attempts: {attempt_text}. Last response repr: {debug_last}"
-
     return False, error_msg
 
 def save_metadata_to_table(email: str, auth_user_id: str, is_adult: bool, image_path: str, image_url: str):
