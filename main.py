@@ -94,30 +94,103 @@ def _parse_supabase_response(res):
         return False, None, f"Exception while parsing response: {exc}"
 
 
+def check_user_exists(email: str):
+    """
+    Return (exists: bool, reason: str).
+    Checks:
+      1) users table for a matching email
+      2) Supabase Auth for an existing user with that email (tries multiple client shapes)
+    """
+    # 1) Check users table first
+    try:
+        tbl_res = supabase.table("users").select("email").eq("email", email).limit(1).execute()
+        ok, data, err = _parse_supabase_response(tbl_res)
+        if ok:
+            users = data or []
+            if isinstance(users, dict) and "data" in users:
+                users = users.get("data") or []
+            if isinstance(users, list) and len(users) > 0:
+                return True, "Found in users table"
+    except Exception:
+        pass
+
+    # 2) Check Auth service via common admin helpers (defensive)
+    # Try multiple possible client method shapes
+    try:
+        # method: supabase.auth.api.get_user_by_email
+        try:
+            auth_res = supabase.auth.api.get_user_by_email(email)
+            ok, data, err = _parse_supabase_response(auth_res)
+            if ok and data:
+                return True, "Found in Supabase Auth (api.get_user_by_email)"
+        except Exception:
+            pass
+
+        # method: supabase.auth.admin.get_user_by_email
+        try:
+            auth_res = supabase.auth.admin.get_user_by_email(email)
+            ok, data, err = _parse_supabase_response(auth_res)
+            if ok and data:
+                return True, "Found in Supabase Auth (auth.admin.get_user_by_email)"
+        except Exception:
+            pass
+
+        # method: supabase.auth.get_user_by_email (some clients)
+        try:
+            auth_res = supabase.auth.get_user_by_email(email)
+            ok, data, err = _parse_supabase_response(auth_res)
+            if ok and data:
+                return True, "Found in Supabase Auth (auth.get_user_by_email)"
+        except Exception:
+            pass
+
+        # method: list users (if available)
+        try:
+            users_list = supabase.auth.list_users()
+            ok, data, err = _parse_supabase_response(users_list)
+            if ok and isinstance(data, dict) and "users" in data:
+                for u in data["users"]:
+                    if u.get("email") == email:
+                        return True, "Found in Supabase Auth (list_users)"
+        except Exception:
+            pass
+
+        # Last resort: query auth.users via SQL may not be supported by all clients
+        try:
+            sql = f"SELECT id FROM auth.users WHERE email = '{email.replace(\"'\", \"''\")}' LIMIT 1;"
+            # Many clients won't support raw SQL this way; ignore errors
+            if hasattr(supabase, "rpc"):
+                sql_res = supabase.rpc("sql", {"q": sql})
+                ok, data, err = _parse_supabase_response(sql_res)
+                if ok and data:
+                    return True, "Found in auth.users via SQL"
+        except Exception:
+            pass
+
+    except Exception:
+        pass
+
+    return False, "Not found"
+
+
 def create_auth_user(email: str, password: str):
     """
     Create a Supabase Auth user using sign_up.
-    Tries multiple call shapes to support different client versions:
-      - sign_up({"email": email, "password": password})
-      - sign_up(email, password)
-      - sign_up({"email": email})
-      - sign_up(email)
+    Tries multiple call shapes to support different client versions.
     Returns (ok: bool, payload_or_error).
-    On success payload will be a dict with 'user' and/or 'session' when available.
     """
-    # Attempt 1: dict-style (recommended for many clients)
     attempts = []
+    # Attempt 1: dict-style
     try:
         res = supabase.auth.sign_up({"email": email, "password": password})
         ok, data, err = _parse_supabase_response(res)
         if ok:
             return True, data
-        # if not ok, store the error and fall through to other attempts
         attempts.append(("dict-style", err or data))
     except Exception as e:
         attempts.append(("dict-style-exception", str(e)))
 
-    # Attempt 2: positional args (some clients require this)
+    # Attempt 2: positional args
     try:
         res = supabase.auth.sign_up(email, password)
         ok, data, err = _parse_supabase_response(res)
@@ -127,7 +200,7 @@ def create_auth_user(email: str, password: str):
     except Exception as e:
         attempts.append(("positional-exception", str(e)))
 
-    # Attempt 3: single-dict (some clients accept only email and handle password elsewhere)
+    # Attempt 3: single-dict (email-only)
     try:
         res = supabase.auth.sign_up({"email": email})
         ok, data, err = _parse_supabase_response(res)
@@ -147,9 +220,7 @@ def create_auth_user(email: str, password: str):
     except Exception as e:
         attempts.append(("positional-email-only-exception", str(e)))
 
-    # Special handling: if we received an AuthResponse-like object in earlier attempts but parser didn't treat as ok,
-    # we still try to extract user/session attributes directly from the last response object if available.
-    # (Note: only works if `res` exists in scope and is an object — we try-catch to avoid crashes.)
+    # Try to extract user/session if last res had those attributes
     try:
         if 'res' in locals() and (hasattr(res, "user") or hasattr(res, "session")):
             payload = {}
@@ -184,9 +255,9 @@ def create_auth_user(email: str, password: str):
     except Exception:
         pass
 
-
     attempt_text = "; ".join([f"{k}: {v}" for k, v in attempts])
     return False, f"All sign_up attempts failed. Attempts: {attempt_text}"
+
 
 def upload_id_image_to_storage(uploaded_file, path: str):
     """
@@ -217,9 +288,7 @@ def upload_id_image_to_storage(uploaded_file, path: str):
                 if hasattr(res, "path") and getattr(res, "path"):
                     inner_path = getattr(res, "path")
                 elif hasattr(res, "full_path") and getattr(res, "full_path"):
-                    # some clients include bucket prefix; strip bucket if present
                     fp = getattr(res, "full_path")
-                    # if full_path starts with "<bucket_name>/", remove that prefix
                     prefix = f"{BUCKET_NAME}/"
                     if isinstance(fp, str) and fp.startswith(prefix):
                         inner_path = fp[len(prefix):]
@@ -245,7 +314,6 @@ def upload_id_image_to_storage(uploaded_file, path: str):
                             return True, data2.get("publicUrl") or data2.get("publicURL") or data2.get("public_url") or str(data2)
                         return True, str(data2)
                     else:
-                        # upload succeeded, but get_public_url returned something unexpected
                         return True, f"Upload succeeded; could not obtain public URL: {err2 or data2}"
                 except Exception as e:
                     return True, f"Upload succeeded; exception obtaining public URL: {e}"
@@ -254,14 +322,11 @@ def upload_id_image_to_storage(uploaded_file, path: str):
             ok, data, err = _parse_supabase_response(res)
             attempts.append((desc, "parsed_ok" if ok else f"parsed_err: {err}"))
             if ok:
-                # Try to extract path from data if possible
                 try:
-                    # Common locations: data['path'] or data.get('Key') etc.
                     p = None
                     if isinstance(data, dict):
                         p = data.get("path") or data.get("full_path") or data.get("fullPath") or data.get("key")
                     if p:
-                        # strip bucket prefix if present
                         prefix = f"{BUCKET_NAME}/"
                         if isinstance(p, str) and p.startswith(prefix):
                             p = p[len(prefix):]
@@ -274,7 +339,6 @@ def upload_id_image_to_storage(uploaded_file, path: str):
                         else:
                             return True, f"Upload succeeded; get_public_url failed: {err2 or data2}"
                     else:
-                        # upload probably succeeded but we couldn't find path; return success with raw data
                         return True, f"Upload seemed to succeed. Response: {data}"
                 except Exception as e:
                     return True, f"Upload seemed to succeed; exception processing response: {e}"
@@ -294,6 +358,7 @@ def upload_id_image_to_storage(uploaded_file, path: str):
     attempt_text = "; ".join([f"{k}: {v}" for k, v in attempts])
     error_msg = f"Upload failed. Attempts: {attempt_text}. Last response repr: {debug_last}"
     return False, error_msg
+
 
 def save_metadata_to_table(email: str, auth_user_id: str, is_adult: bool, image_path: str, image_url: str):
     payload = {
@@ -364,44 +429,49 @@ with col1:
             for e in errors:
                 st.error(e)
         else:
-            with st.spinner("Creating account and uploading ID..."):
-                ok, payload = create_auth_user(email.strip(), password)
-                if not ok:
-                    st.error(f"Failed to create Auth user: {payload}")
-                else:
-                    # Try to extract auth user id from payload
-                    auth_user_id = None
-                    if isinstance(payload, dict):
-                        if "user" in payload and isinstance(payload["user"], dict):
-                            auth_user_id = payload["user"].get("id") or payload["user"].get("sub")
-                        elif "data" in payload and isinstance(payload["data"], dict) and "user" in payload["data"]:
-                            auth_user_id = payload["data"]["user"].get("id") or payload["data"]["user"].get("sub")
-                        elif "id" in payload:
-                            auth_user_id = payload.get("id")
-                        else:
-                            for v in payload.values():
-                                if isinstance(v, dict) and "id" in v:
-                                    auth_user_id = v.get("id")
-                                    break
-                    if not auth_user_id:
-                        # fallback: synthetic id (not ideal but keeps flow)
-                        auth_user_id = str(uuid4())
-
-                    # Build storage path and upload
-                    filename = id_image.name if hasattr(id_image, "name") else f"id_{uuid4().hex}.jpg"
-                    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-                    path = f"users/{auth_user_id}/{timestamp}_{filename}"
-
-                    ok_upload, upload_resp = upload_id_image_to_storage(id_image, path)
-                    if not ok_upload:
-                        st.error(f"Failed to upload ID image: {upload_resp}")
+            # --- NEW: check for existing account first ---
+            exists, reason = check_user_exists(email.strip())
+            if exists:
+                st.error("Account already exists for that email. Please use password reset (or sign in).")
+            else:
+                with st.spinner("Creating account and uploading ID..."):
+                    ok, payload = create_auth_user(email.strip(), password)
+                    if not ok:
+                        st.error(f"Failed to create Auth user: {payload}")
                     else:
-                        image_public_url = upload_resp
-                        ok_meta, meta_resp = save_metadata_to_table(email.strip(), auth_user_id, is_18_or_older, path, image_public_url)
-                        if not ok_meta:
-                            st.error(f"Failed to save metadata: {meta_resp}")
+                        # Try to extract auth user id from payload
+                        auth_user_id = None
+                        if isinstance(payload, dict):
+                            if "user" in payload and isinstance(payload["user"], dict):
+                                auth_user_id = payload["user"].get("id") or payload["user"].get("sub")
+                            elif "data" in payload and isinstance(payload["data"], dict) and "user" in payload["data"]:
+                                auth_user_id = payload["data"]["user"].get("id") or payload["data"]["user"].get("sub")
+                            elif "id" in payload:
+                                auth_user_id = payload.get("id")
+                            else:
+                                for v in payload.values():
+                                    if isinstance(v, dict) and "id" in v:
+                                        auth_user_id = v.get("id")
+                                        break
+                        if not auth_user_id:
+                            # fallback: synthetic id (not ideal but keeps flow)
+                            auth_user_id = str(uuid4())
+
+                        # Build storage path and upload
+                        filename = id_image.name if hasattr(id_image, "name") else f"id_{uuid4().hex}.jpg"
+                        timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+                        path = f"users/{auth_user_id}/{timestamp}_{filename}"
+
+                        ok_upload, upload_resp = upload_id_image_to_storage(id_image, path)
+                        if not ok_upload:
+                            st.error(f"Failed to upload ID image: {upload_resp}")
                         else:
-                            st.success("Account created and metadata saved!")
+                            image_public_url = upload_resp
+                            ok_meta, meta_resp = save_metadata_to_table(email.strip(), auth_user_id, is_18_or_older, path, image_public_url)
+                            if not ok_meta:
+                                st.error(f"Failed to save metadata: {meta_resp}")
+                            else:
+                                st.success("Account created and metadata saved!")
 
 with col2:
     st.header("Dashboard (users)")
@@ -502,11 +572,13 @@ st.caption(
 with st.expander("Admin (dangerous) - Remove test users"):
     admin_key = st.text_input("Admin key", type="password")
     if st.button("Delete all test users (email contains 'test')"):
-        if admin_key == os.getenv("ADMIN_KEY", "") and admin_key != "":
+        if admin_key == ADMIN_KEY and ADMIN_KEY != "":
             try:
                 del_res = supabase.table("users").delete().ilike("email", "%test%").execute()
-                if del_res.error:
-                    st.error(f"Deletion failed: {del_res.error}")
+                # robust parse
+                ok, data, err = _parse_supabase_response(del_res)
+                if not ok:
+                    st.error(f"Deletion failed: {err}")
                 else:
                     st.success("Deleted matching test users.")
             except Exception as e:
