@@ -15,7 +15,6 @@ from PIL import Image
 # ----------------------------
 # Streamlit Cloud provides st.secrets; local dev can set a local secrets.toml or fallback to env vars if you prefer.
 # Example (local): create a file .streamlit/secrets.toml with the same keys for local testing.
-st.write("Loaded secrets:", list(st.secrets.keys()))
 try:
     SUPABASE_URL = st.secrets["SUPABASE_URL"]
     SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
@@ -96,15 +95,67 @@ def _parse_supabase_response(res):
 
 
 def create_auth_user(email: str, password: str):
-    """Create a Supabase Auth user using sign_up (works across client versions)."""
     try:
+        # Preferred call shape
         res = supabase.auth.sign_up({"email": email, "password": password})
     except Exception:
         try:
+            # Alternate call shape some clients expect
             res = supabase.auth.sign_up(email=email, password=password)
         except Exception as e:
             return False, f"Exception calling auth.sign_up: {e}"
 
+    try:
+        if hasattr(res, "user") or hasattr(res, "session"):
+            payload = {}
+
+            # grab user if available
+            user_obj = getattr(res, "user", None)
+            if not user_obj and hasattr(res, "data"):
+                # sometimes response.data contains {'user': {...}}
+                maybe_data = getattr(res, "data")
+                if isinstance(maybe_data, dict) and "user" in maybe_data:
+                    user_obj = maybe_data["user"]
+
+            if user_obj is not None:
+                if isinstance(user_obj, dict):
+                    payload["user"] = user_obj
+                else:
+                    # try to convert common attributes to a dict
+                    try:
+                        user_dict = {}
+                        for attr in ("id", "email", "aud", "role"):
+                            if hasattr(user_obj, attr):
+                                user_dict[attr] = getattr(user_obj, attr)
+                        # fallback to string representation if empty
+                        payload["user"] = user_dict if user_dict else str(user_obj)
+                    except Exception:
+                        payload["user"] = str(user_obj)
+
+            # grab session if available
+            session_obj = getattr(res, "session", None)
+            if session_obj is not None:
+                if isinstance(session_obj, dict):
+                    payload["session"] = session_obj
+                else:
+                    try:
+                        # session may have access_token, expires_at etc.
+                        sess = {}
+                        for attr in ("access_token", "expires_at", "refresh_token"):
+                            if hasattr(session_obj, attr):
+                                sess[attr] = getattr(session_obj, attr)
+                        payload["session"] = sess if sess else str(session_obj)
+                    except Exception:
+                        payload["session"] = str(session_obj)
+
+            # If we got at least something, return success
+            if payload:
+                return True, payload
+            # else fall through to generic parsing
+    except Exception:
+        # don't crash here; fall back to generic parser below
+        pass
+    
     ok, data, err = _parse_supabase_response(res)
     if ok:
         return True, data
