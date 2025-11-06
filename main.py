@@ -95,51 +95,83 @@ def _parse_supabase_response(res):
 
 
 def create_auth_user(email: str, password: str):
+    """
+    Create a Supabase Auth user using sign_up.
+    Tries multiple call shapes to support different client versions:
+      - sign_up({"email": email, "password": password})
+      - sign_up(email, password)
+      - sign_up({"email": email})
+      - sign_up(email)
+    Returns (ok: bool, payload_or_error).
+    On success payload will be a dict with 'user' and/or 'session' when available.
+    """
+    # Attempt 1: dict-style (recommended for many clients)
+    attempts = []
     try:
-        # Preferred call shape
         res = supabase.auth.sign_up({"email": email, "password": password})
-    except Exception:
-        try:
-            # Alternate call shape some clients expect
-            res = supabase.auth.sign_up(email=email, password=password)
-        except Exception as e:
-            return False, f"Exception calling auth.sign_up: {e}"
+        ok, data, err = _parse_supabase_response(res)
+        if ok:
+            return True, data
+        # if not ok, store the error and fall through to other attempts
+        attempts.append(("dict-style", err or data))
+    except Exception as e:
+        attempts.append(("dict-style-exception", str(e)))
 
+    # Attempt 2: positional args (some clients require this)
     try:
-        if hasattr(res, "user") or hasattr(res, "session"):
+        res = supabase.auth.sign_up(email, password)
+        ok, data, err = _parse_supabase_response(res)
+        if ok:
+            return True, data
+        attempts.append(("positional", err or data))
+    except Exception as e:
+        attempts.append(("positional-exception", str(e)))
+
+    # Attempt 3: single-dict (some clients accept only email and handle password elsewhere)
+    try:
+        res = supabase.auth.sign_up({"email": email})
+        ok, data, err = _parse_supabase_response(res)
+        if ok:
+            return True, data
+        attempts.append(("dict-email-only", err or data))
+    except Exception as e:
+        attempts.append(("dict-email-only-exception", str(e)))
+
+    # Attempt 4: single-positional (email only)
+    try:
+        res = supabase.auth.sign_up(email)
+        ok, data, err = _parse_supabase_response(res)
+        if ok:
+            return True, data
+        attempts.append(("positional-email-only", err or data))
+    except Exception as e:
+        attempts.append(("positional-email-only-exception", str(e)))
+
+    # Special handling: if we received an AuthResponse-like object in earlier attempts but parser didn't treat as ok,
+    # we still try to extract user/session attributes directly from the last response object if available.
+    # (Note: only works if `res` exists in scope and is an object — we try-catch to avoid crashes.)
+    try:
+        if 'res' in locals() and (hasattr(res, "user") or hasattr(res, "session")):
             payload = {}
-
-            # grab user if available
             user_obj = getattr(res, "user", None)
-            if not user_obj and hasattr(res, "data"):
-                # sometimes response.data contains {'user': {...}}
-                maybe_data = getattr(res, "data")
-                if isinstance(maybe_data, dict) and "user" in maybe_data:
-                    user_obj = maybe_data["user"]
-
             if user_obj is not None:
                 if isinstance(user_obj, dict):
                     payload["user"] = user_obj
                 else:
-                    # try to convert common attributes to a dict
                     try:
                         user_dict = {}
                         for attr in ("id", "email", "aud", "role"):
                             if hasattr(user_obj, attr):
                                 user_dict[attr] = getattr(user_obj, attr)
-                        # fallback to string representation if empty
                         payload["user"] = user_dict if user_dict else str(user_obj)
                     except Exception:
                         payload["user"] = str(user_obj)
-
-            # grab session if available
             session_obj = getattr(res, "session", None)
             if session_obj is not None:
                 if isinstance(session_obj, dict):
                     payload["session"] = session_obj
                 else:
                     try:
-                        # session may have access_token, expires_at etc.
                         sess = {}
                         for attr in ("access_token", "expires_at", "refresh_token"):
                             if hasattr(session_obj, attr):
@@ -147,21 +179,13 @@ def create_auth_user(email: str, password: str):
                         payload["session"] = sess if sess else str(session_obj)
                     except Exception:
                         payload["session"] = str(session_obj)
-
-            # If we got at least something, return success
             if payload:
                 return True, payload
-            # else fall through to generic parsing
     except Exception:
-        # don't crash here; fall back to generic parser below
         pass
-    
-    ok, data, err = _parse_supabase_response(res)
-    if ok:
-        return True, data
-    else:
-        return False, err
 
+    attempt_text = "; ".join([f"{k}: {v}" for k, v in attempts])
+    return False, f"All sign_up attempts failed. Attempts: {attempt_text}"
 
 def upload_id_image_to_storage(uploaded_file, path: str):
     """
