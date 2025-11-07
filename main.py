@@ -786,98 +786,204 @@ elif page == "login":
     if st.button("Back to Sign up"):
         go_to_page("signup")
 
+# ----------------------------
+# Dashboard: courses, cart, payments, transactions, notifications
+# Replaced existing dashboard implementation with the enriched dashboard UI
+# ----------------------------
 elif page == "dashboard":
+    # ensure logged-in
     if not st.session_state.get("logged_in"):
         st.warning("You must be logged in to view the dashboard. Redirecting to login...")
         go_to_page("login")
     else:
-        st.header(f"Dashboard (users) — Logged in as {st.session_state.get('user_email')}")
-        if st.button("Logout"):
-            do_logout()
-
-        # Robust fetch: try to select expected columns, fallback if DB doesn't have them
-        try:
-            users_res = supabase.table("users").select("email,auth_user_id,is_adult,created_at,id_image_public_url").order("created_at", desc=True).limit(500).execute()
-            ok, data, err = _parse_supabase_response(users_res)
-            if not ok:
-                err_str = str(err) if err is not None else ""
-                if "does not exist" in err_str or "column" in err_str:
-                    users_res = supabase.table("users").select("*").order("created_at", desc=True).limit(500).execute()
-                    ok2, data2, err2 = _parse_supabase_response(users_res)
-                    if not ok2:
-                        st.error(f"Failed to load users after fallback: {err2}")
-                        users_df = pd.DataFrame()
-                    else:
-                        users = data2 or []
-                        if isinstance(users, dict) and "data" in users:
-                            users = users.get("data") or []
-                        users_df = pd.DataFrame(users)
-                else:
-                    st.error(f"Failed to load users: {err}")
-                    users_df = pd.DataFrame()
-            else:
-                users = data or []
-                if isinstance(users, dict) and "data" in users:
-                    users = users.get("data") or []
-                users_df = pd.DataFrame(users)
-
-            if not users_df.empty and "created_at" in users_df.columns:
-                users_df["created_at"] = pd.to_datetime(users_df["created_at"], utc=True)
-        except Exception as e:
-            st.error(f"Exception fetching users: {e}")
-            users_df = pd.DataFrame()
-
-        # Metrics
-        col_a, col_b, col_c = st.columns(3)
-        total_users = len(users_df)
-        adults = int(users_df["is_adult"].sum()) if (not users_df.empty and "is_adult" in users_df.columns) else 0
-        non_adults = total_users - adults
-
-        col_a.metric("Total users", total_users)
-        col_b.metric("18+ users", adults)
-        col_c.metric("Under 18 (reported)", non_adults)
-
-        st.subheader("Recent signups")
-        if users_df.empty:
-            st.info("No user records found yet.")
+        # theme toggle (simple)
+        if "theme" not in st.session_state:
+            st.session_state["theme"] = "dark"  # default
+        # small theme CSS switch
+        if st.session_state["theme"] == "dark":
+            st.markdown(
+                """
+                <style>
+                .stApp { background: linear-gradient(180deg,#071024 0%, #02101a 100%); color: #e6eef8; }
+                .card { background: rgba(255,255,255,0.03); padding:12px; border-radius:10px; }
+                </style>
+                """,
+                unsafe_allow_html=True,
+            )
         else:
-            recent_cols = [c for c in ["email", "auth_user_id", "is_adult", "created_at"] if c in users_df.columns]
-            st.dataframe(users_df.loc[:, recent_cols].head(20))
+            st.markdown(
+                """
+                <style>
+                .stApp { background: linear-gradient(180deg,#ffffff 0%, #f3f6fb 100%); color: #0b1a2b; }
+                .card { background: #ffffff; padding:12px; border-radius:10px; box-shadow: 0 4px 12px rgba(2,6,23,0.06); }
+                </style>
+                """,
+                unsafe_allow_html=True,
+            )
 
-            st.subheader("Latest ID preview")
-            if "id_image_public_url" in users_df.columns:
-                latest_with_image = users_df[users_df["id_image_public_url"].notnull() & (users_df["id_image_public_url"] != "")]
-            elif "id_image_path" in users_df.columns:
-                latest_with_image = users_df[users_df["id_image_path"].notnull() & (users_df["id_image_path"] != "")]
+        # Header
+        st.markdown(f"### Dashboard — Welcome, **{st.session_state.get('user_email')}**")
+
+        # Sidebar mini-controls inside main area (since main sidebar holds nav)
+        col_top_left, col_top_right = st.columns([3, 1])
+        with col_top_right:
+            if st.button("Toggle theme"):
+                st.session_state["theme"] = "light" if st.session_state["theme"] == "dark" else "dark"
+                go_to_page("dashboard")  # rerun to apply theme
+
+        # --- Course catalog: generate 30 courses ---
+        # If you have a database of courses, replace this generation with a supabase.table("courses").select(...)
+        def _generate_courses():
+            base = [
+                ("Python for Beginners", 19.0),
+                ("Advanced Python", 29.0),
+                ("Data Structures & Algorithms (Python)", 39.0),
+                ("Web Development with Flask", 24.0),
+                ("Django Fullstack", 34.0),
+                ("JavaScript Essentials", 19.0),
+                ("React from Scratch", 29.0),
+                ("Next.js Practical", 34.0),
+                ("TypeScript Mastery", 29.0),
+                ("Node.js & Express", 24.0),
+                ("Databases with PostgreSQL", 29.0),
+                ("SQL for Data Analysis", 19.0),
+                ("Machine Learning Intro", 49.0),
+                ("Deep Learning with PyTorch", 59.0),
+                ("Data Engineering Basics", 39.0),
+                ("DevOps & CI/CD", 34.0),
+                ("Docker & Kubernetes", 39.0),
+                ("System Design Essentials", 44.0),
+                ("Cloud Fundamentals (AWS)", 39.0),
+                ("Cloud on GCP", 39.0),
+                ("Mobile Dev with Flutter", 29.0),
+                ("iOS App Development (Swift)", 34.0),
+                ("Android Development (Kotlin)", 34.0),
+                ("Cybersecurity Basics", 24.0),
+                ("Ethical Hacking Intro", 39.0),
+                ("Blockchain Fundamentals", 34.0),
+                ("Smart Contracts with Solidity", 44.0),
+                ("Data Visualization (Plotly)", 24.0),
+                ("Natural Language Processing", 49.0),
+                ("Interview Prep - Algorithms", 29.0),
+            ]
+            courses = []
+            for i, (title, price) in enumerate(base, start=1):
+                courses.append({
+                    "id": i,
+                    "title": title,
+                    "price_usd": float(price),
+                    "duration_hours": 10 + (i % 5) * 5,
+                    "level": ["Beginner", "Intermediate", "Advanced"][i % 3],
+                })
+            return courses
+
+        courses = _generate_courses()
+        courses_df = pd.DataFrame(courses)
+
+        # Cart stored in session
+        if "cart" not in st.session_state:
+            st.session_state["cart"] = []
+
+        # Main layout: left = catalog, right = cart/transactions/notifications tabs
+        left, right = st.columns([3, 1.2])
+
+        # Left: show catalog with add-to-cart buttons
+        with left:
+            st.subheader("Available Programming Courses")
+            # table view toggle
+            view = st.radio("View as", ["Table", "Cards"], index=0, horizontal=True)
+            if view == "Table":
+                # show dataframe
+                df_display = courses_df[["id", "title", "level", "duration_hours", "price_usd"]].copy()
+                df_display.rename(columns={"duration_hours": "hours", "price_usd": "price (USD)"}, inplace=True)
+                st.dataframe(df_display, use_container_width=True)
+                # add purchase by id
+                st.markdown("**Quick buy by ID**")
+                col_a, col_b = st.columns([1, 1])
+                with col_a:
+                    buy_id = st.number_input("Course ID", min_value=1, max_value=len(courses), step=1, value=1)
+                with col_b:
+                    if st.button("Add to cart by ID"):
+                        chosen = next((c for c in courses if c["id"] == int(buy_id)), None)
+                        if chosen:
+                            st.session_state["cart"].append(chosen)
+                            st.success(f'Added "{chosen["title"]}" to cart.')
             else:
-                latest_with_image = pd.DataFrame()
+                # cards
+                for c in courses:
+                    with st.container():
+                        st.markdown(f'<div class="card"><b>{c["title"]}</b> — {c["level"]} • {c["duration_hours"]} hrs<br>Price: ${c["price_usd"]:.2f}</div>', unsafe_allow_html=True)
+                        cols = st.columns([1, 4])
+                        with cols[0]:
+                            if st.button(f"Add #{c['id']}", key=f"add_{c['id']}"):
+                                st.session_state["cart"].append(c)
+                                st.success(f'Added "{c["title"]}" to cart.')
+                        with cols[1]:
+                            st.write("")  # spacer
 
-            if not latest_with_image.empty:
-                if "id_image_public_url" in latest_with_image.columns:
-                    latest_url = latest_with_image.iloc[0]["id_image_public_url"]
+        # Right: cart, checkout, notifications, transactions quick view
+        with right:
+            st.subheader("Cart")
+            if len(st.session_state["cart"]) == 0:
+                st.info("Cart is empty.")
+            else:
+                total = sum(item["price_usd"] for item in st.session_state["cart"])
+                for idx, item in enumerate(st.session_state["cart"], start=1):
+                    st.write(f'{idx}. {item["title"]} — ${item["price_usd"]:.2f}')
+                st.markdown(f"**Total: ${total:.2f}**")
+                if st.button("Checkout / Purchase"):
+                    # simulate payment and record transaction(s) to Supabase 'transactions' table
+                    purchases = []
+                    for item in st.session_state["cart"]:
+                        purchases.append({
+                            "email": st.session_state.get("user_email"),
+                            "course_title": item["title"],
+                            "price_usd": float(item["price_usd"]),
+                            "created_at": datetime.utcnow().isoformat(),
+                        })
+                    # insert into Supabase (best-effort)
                     try:
-                        st.image(latest_url, caption="Latest uploaded ID (public URL)", use_column_width=True)
-                    except Exception:
-                        st.text("Could not load latest image via public URL.")
-                else:
-                    try:
-                        row = latest_with_image.iloc[0]
-                        path = row.get("id_image_path")
-                        if path:
-                            url_res = supabase.storage.from_(BUCKET_NAME).get_public_url(path)
-                            oku, datu, erru = _parse_supabase_response(url_res)
-                            if oku:
-                                if isinstance(datu, dict):
-                                    pub = datu.get("publicUrl") or datu.get("publicURL") or datu.get("public_url") or str(datu)
-                                else:
-                                    pub = str(datu)
-                                st.image(pub, caption="Latest uploaded ID (constructed URL)", use_column_width=True)
-                            else:
-                                st.text("Could not construct public URL for latest image.")
+                        res = supabase.table("transactions").insert(purchases).execute()
+                        ok, data, err = _parse_supabase_response(res)
+                        if ok:
+                            st.success("Purchase recorded. Thank you!")
+                            # push a simple notification into session notifications
+                            if "notifications" not in st.session_state:
+                                st.session_state["notifications"] = []
+                            st.session_state["notifications"].append(f"Purchased {len(purchases)} course(s) for ${total:.2f}")
+                            # clear cart
+                            st.session_state["cart"] = []
                         else:
-                            st.text("No image path available for preview.")
-                    except Exception:
-                        st.text("Could not preview the latest image.")
+                            st.error(f"Purchase failed to record: {err}")
+                    except Exception as e:
+                        st.error(f"Error recording purchase: {e}")
+
+            st.markdown("---")
+            # Notifications
+            st.subheader("Notifications")
+            if "notifications" not in st.session_state:
+                st.session_state["notifications"] = []
+            if len(st.session_state["notifications"]) == 0:
+                st.info("No notifications.")
+            else:
+                for n in reversed(st.session_state["notifications"]):
+                    st.write("• " + n)
+            if st.button("Clear notifications"):
+                st.session_state["notifications"] = []
+
+            st.markdown("---")
+            # quick links
+            if st.button("Go to Services"):
+                go_to_page("signup")  # or your services page
+            if st.button("Contact"):
+                st.info("Email: hello@fayosmarvel.tech — we'll add a contact form soon.")
+
+            st.markdown("---")
+            # Transactions quick link -> go to transactions page (sidebar also has it)
+            if st.button("View my transactions"):
+                go_to_page("account")  # we'll show transactions in 'account' page
+
+        # End dashboard content
 
 elif page == "settings":
     if not st.session_state.get("logged_in"):
