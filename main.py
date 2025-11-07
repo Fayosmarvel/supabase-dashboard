@@ -510,38 +510,38 @@ def go_to_page(page_name: str):
 # UI / Pages
 # ----------------------------
 # -- hero / header (two-column card with provided logo) --
+# === improved hero block (replace previous hero code) ===
 st.set_page_config(page_title="Fayos Marvel Tech Company", layout="wide")
 
-# CSS for the hero card
+# CSS: translucent hero card (no pure white box)
 st.markdown(
     """
     <style>
     .hero-card {
         display: flex;
-        gap: 16px;
+        gap: 18px;
         align-items: center;
         padding: 18px;
         border-radius: 12px;
-        background: linear-gradient(90deg, rgba(255,255,255,0.96), rgba(245,247,250,0.96));
-        box-shadow: 0 6px 18px rgba(16,24,40,0.06);
+        background: rgba(255,255,255,0.02); /* almost transparent */
+        backdrop-filter: blur(4px);
+        border: 1px solid rgba(255,255,255,0.03);
+        box-shadow: 0 8px 30px rgba(2,6,23,0.12);
     }
-    .hero-title {
-        font-size: 28px;
-        font-weight: 800;
-        margin: 0 0 8px 0;
-        text-transform: capitalize;
+    .hero-title { font-size: 28px; font-weight: 800; margin: 0 0 8px 0; color: #e6eef8; text-transform: capitalize; }
+    .hero-sub { margin: 0 0 12px 0; color: #d8e6ff; line-height: 1.45; }
+    .hero-ctas { display: flex; gap:10px; margin-top:8px; }
+    /* page background darken so translucent card looks good */
+    .stApp {
+        background: linear-gradient(180deg, #071024 0%, #02101a 100%);
+        color: #e6eef8;
     }
-    .hero-sub {
-        margin: 0 0 12px 0;
-        color: #334155;
-        line-height: 1.45;
-    }
-    .hero-ctas { display:flex; gap:10px; margin-top:8px; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
+# layout columns
 left_col, right_col = st.columns([2.6, 1.4])
 
 with left_col:
@@ -574,15 +574,51 @@ with left_col:
         if st.button("Learn more"):
             st.info("We provide IT infrastructure, cloud, security, and software services. Contact us to learn more.")
 
+    st.markdown('<div style="color:#aebfdc; font-size:12px; margin-top:8px;">Trusted partner for SMEs, startups and enterprises.</div>', unsafe_allow_html=True)
+
 with right_col:
-    # Use the uploaded image path you provided. If you move the file, update this path.
-    company_img_path = "/mnt/data/ChatGPT Image Nov 7, 2025, 12_11_34 PM.png"
-    try:
-        st.image(company_img_path, caption="Fayos Marvel logo", use_column_width=True)
-    except Exception as e:
-        # fallback to text title on error
-        st.error("Logo could not be loaded. Check the image path.")
-        st.markdown("**Fayos Marvel Tech Company**")
+    # Try loading the logo from multiple possible locations (developer-friendly)
+    # 1) Prefer a packaged repo file (recommended). Put your logo at ./assets/logo.png
+    repo_logo = os.path.join(os.getcwd(), "assets", "logo.png")
+    # 2) The absolute path you gave earlier (dev-only)
+    provided_path = "/mnt/data/ChatGPT Image Nov 7, 2025, 12_11_34 PM.png"
+    # 3) Allow dev uploading if needed (not persisted across runs)
+    uploaded_logo = st.file_uploader("Upload logo (optional, for dev)", type=["png","jpg","jpeg"])
+
+    logo_to_show = None
+    logo_source = None
+
+    if uploaded_logo is not None:
+        try:
+            logo_bytes = uploaded_logo.read()
+            logo_to_show = logo_bytes
+            logo_source = "uploaded"
+        except Exception:
+            logo_to_show = None
+
+    if logo_to_show is None and os.path.exists(repo_logo):
+        logo_to_show = repo_logo
+        logo_source = "repo"
+    elif logo_to_show is None and os.path.exists(provided_path):
+        logo_to_show = provided_path
+        logo_source = "provided"
+
+    # Display helpful diagnostics in the UI so you can see what's happening:
+    st.markdown("<div style='color:#9fb0d8; font-size:12px;'>Logo debug:</div>", unsafe_allow_html=True)
+    st.text(f"Repo path: {repo_logo} (exists: {os.path.exists(repo_logo)})")
+    st.text(f"Provided path: {provided_path} (exists: {os.path.exists(provided_path)})")
+    if uploaded_logo is not None:
+        st.text("Uploaded logo present (will use uploaded file)")
+
+    if logo_to_show:
+        try:
+            # If it's raw bytes (uploaded), pass bytes; else pass path
+            st.image(logo_to_show, caption="Fayos Marvel logo", use_column_width=True)
+            st.success(f"Logo loaded from: {logo_source}")
+        except Exception as e:
+            st.error(f"Logo could not be displayed: {e}")
+    else:
+        st.warning("Logo could not be loaded. Place logo at ./assets/logo.png or upload it using the uploader above.")
 
 # show top message if any
 if st.session_state.get("message"):
