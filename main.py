@@ -157,7 +157,7 @@ def check_user_exists(email: str):
 
         # Last resort: query auth.users via SQL may not be supported by all clients
         try:
-            sql = f"SELECT id FROM auth.users WHERE email = '{email.replace(\"'\", \"''\")}' LIMIT 1;"
+            sql = f"""SELECT id FROM auth.users WHERE email = '{email.replace("'", "''")}' LIMIT 1;"""
             # Many clients won't support raw SQL this way; ignore errors
             if hasattr(supabase, "rpc"):
                 sql_res = supabase.rpc("sql", {"q": sql})
