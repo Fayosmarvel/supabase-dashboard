@@ -40,7 +40,6 @@ def is_valid_email(email: str) -> bool:
 def _parse_supabase_response(res):
     """
     Normalize different supabase client responses into (ok: bool, data, error_message).
-    Handles objects with .data/.error, objects with .status_code/.data/.json, or plain dicts.
     """
     try:
         if hasattr(res, "data") or hasattr(res, "error"):
@@ -354,11 +353,64 @@ def sign_in_user(email: str, password: str):
     return False, final_msg
 
 
+# ----------------------------
+# Password reset & resend confirmation helpers
+# ----------------------------
+def _try_calls(calls):
+    """Utility: try callables in order, parse result with _parse_supabase_response."""
+    attempts = []
+    for name, fn in calls:
+        try:
+            res = fn()
+            ok, data, err = _parse_supabase_response(res)
+            if ok:
+                return True, f"Success ({name})", data
+            attempts.append((name, err or data))
+        except Exception as e:
+            attempts.append((name, str(e)))
+    return False, f"All attempts failed: {attempts}", None
+
+
+def send_password_reset(email: str):
+    """
+    Try to trigger Supabase password reset email using several client shapes.
+    Returns (ok: bool, msg: str).
+    """
+    calls = []
+    # Common shapes
+    calls.append(("auth.api.reset_password_for_email", lambda: supabase.auth.api.reset_password_for_email(email)))
+    calls.append(("auth.reset_password_for_email", lambda: supabase.auth.reset_password_for_email(email)))
+    calls.append(("auth.send_reset_password_email", lambda: supabase.auth.send_reset_password_email(email)))
+    calls.append(("auth.admin.reset_user_password", lambda: supabase.auth.admin.reset_user_password(email)))
+    # Try a generic rpc/endpoint if project exposes it (best-effort)
+    calls.append(("rpc.reset_password", lambda: supabase.rpc("reset_password", {"email": email})))
+    ok, msg, data = _try_calls(calls)
+    if ok:
+        return True, "Password reset requested — check your email for instructions."
+    # Fall back message includes reason
+    return False, f"Could not request password reset. {msg}"
+
+
+def resend_confirmation(email: str):
+    """
+    Try to resend confirmation email via common admin/api shapes.
+    Returns (ok: bool, msg: str).
+    """
+    calls = []
+    calls.append(("auth.api.generate_confirmation", lambda: supabase.auth.api.generate_confirmation(email)))
+    calls.append(("auth.api.send_user_confirmation", lambda: supabase.auth.api.send_user_confirmation(email)))
+    calls.append(("auth.admin.generate_link", lambda: supabase.auth.admin.generate_link('confirm', email)))
+    calls.append(("auth.send_confirmation_email", lambda: supabase.auth.send_confirmation_email(email)))
+    ok, msg, data = _try_calls(calls)
+    if ok:
+        return True, "Confirmation email resent — check your inbox (and spam)."
+    return False, f"Could not resend confirmation. {msg}"
+
+
+# ----------------------------
+# Upload helpers (unchanged)
+# ----------------------------
 def upload_id_image_to_storage(uploaded_file, path: str):
-    """
-    Robust upload helper for Supabase Storage that understands UploadResponse objects.
-    Returns (ok: bool, public_url_or_error_str).
-    """
     attempts = []
     try:
         file_bytes = uploaded_file.getvalue()
@@ -473,6 +525,7 @@ if "user_email" not in st.session_state:
 if "message" not in st.session_state:
     st.session_state["message"] = ""
 
+
 def do_logout():
     st.session_state["logged_in"] = False
     st.session_state["user_email"] = None
@@ -487,6 +540,7 @@ def current_page():
     params = st.experimental_get_query_params()
     page = params.get("page", ["signup"])[0]
     return page
+
 
 def go_to_page(page_name: str):
     """
@@ -507,43 +561,64 @@ def go_to_page(page_name: str):
 
 
 # ----------------------------
-# UI / Pages
+# UI / Theme + Sidebar + Hero
 # ----------------------------
-# -- hero / header (two-column card with provided logo) --
-# === improved hero block (replace previous hero code) ===
 st.set_page_config(page_title="Fayos Marvel Tech Company", layout="wide")
 
-# CSS: translucent hero card (no pure white box)
+# tiny theme + CSS
 st.markdown(
     """
     <style>
-    .hero-card {
-        display: flex;
-        gap: 18px;
-        align-items: center;
-        padding: 18px;
-        border-radius: 12px;
-        background: rgba(255,255,255,0.02); /* almost transparent */
-        backdrop-filter: blur(4px);
-        border: 1px solid rgba(255,255,255,0.03);
-        box-shadow: 0 8px 30px rgba(2,6,23,0.12);
-    }
-    .hero-title { font-size: 28px; font-weight: 800; margin: 0 0 8px 0; color: #e6eef8; text-transform: capitalize; }
-    .hero-sub { margin: 0 0 12px 0; color: #d8e6ff; line-height: 1.45; }
-    .hero-ctas { display: flex; gap:10px; margin-top:8px; }
-    /* page background darken so translucent card looks good */
-    .stApp {
-        background: linear-gradient(180deg, #071024 0%, #02101a 100%);
-        color: #e6eef8;
-    }
+    .stApp { background: linear-gradient(180deg,#071024 0%, #02101a 100%); color: #e6eef8; }
+    .hero-card { display:flex; gap:18px; align-items:center; padding:18px; border-radius:12px;
+                 background: rgba(255,255,255,0.02); backdrop-filter: blur(4px); border:1px solid rgba(255,255,255,0.03);} 
+    .hero-title { font-size:28px; font-weight:800; margin:0 0 8px 0; color:#f8fbff; text-transform:capitalize; }
+    .hero-sub { margin:0 0 12px 0; color:#d6e8ff; line-height:1.45; }
+    .sidebar-logo { width: 100%; border-radius:8px; margin-bottom: 8px; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# layout columns
-left_col, right_col = st.columns([2.6, 1.4])
+# Sidebar: logo + nav
+with st.sidebar:
+    local_logo = os.path.join(os.getcwd(), "assets", "logo.png")
+    if os.path.exists(local_logo):
+        st.image(local_logo, use_column_width=True, output_format="PNG")
+    else:
+        fallback = "/mnt/data/ChatGPT Image Nov 7, 2025, 12_11_34 PM.png"
+        if os.path.exists(fallback):
+            st.image(fallback, use_column_width=True, output_format="PNG")
+        else:
+            st.markdown("**Fayos Marvel Tech Company**")
 
+    st.markdown("---")
+    if st.session_state.get("logged_in"):
+        page_choice = st.radio("Menu", ["Dashboard", "Settings", "Account", "Logout"], index=0)
+    else:
+        page_choice = st.radio("Menu", ["Home", "Signup", "Login"], index=0)
+
+    # Map radio to query params/page
+    if page_choice == "Home":
+        st.experimental_set_query_params(page="signup")
+    elif page_choice == "Signup":
+        st.experimental_set_query_params(page="signup")
+    elif page_choice == "Login":
+        st.experimental_set_query_params(page="login")
+    elif page_choice == "Dashboard":
+        st.experimental_set_query_params(page="dashboard")
+    elif page_choice == "Settings":
+        st.experimental_set_query_params(page="settings")
+    elif page_choice == "Account":
+        st.experimental_set_query_params(page="account")
+    elif page_choice == "Logout":
+        do_logout()
+        # go_to_page will handle rerun/exit if needed
+        go_to_page("signup")
+
+
+# Header / hero
+left_col, right_col = st.columns([2.6, 1.4])
 with left_col:
     st.markdown(
         """
@@ -562,63 +637,12 @@ with left_col:
         """,
         unsafe_allow_html=True,
     )
-
-    c1, c2, c3 = st.columns([1, 1, 1])
-    with c1:
-        if st.button("Create account"):
-            go_to_page("signup")
-    with c2:
-        if st.button("Login"):
-            go_to_page("login")
-    with c3:
-        if st.button("Learn more"):
-            st.info("We provide IT infrastructure, cloud, security, and software services. Contact us to learn more.")
-
-    st.markdown('<div style="color:#aebfdc; font-size:12px; margin-top:8px;">Trusted partner for SMEs, startups and enterprises.</div>', unsafe_allow_html=True)
-
 with right_col:
-    # Try loading the logo from multiple possible locations (developer-friendly)
-    # 1) Prefer a packaged repo file (recommended). Put your logo at ./assets/logo.png
-    repo_logo = os.path.join(os.getcwd(), "assets", "logo.png")
-    # 2) The absolute path you gave earlier (dev-only)
-    provided_path = "/mnt/data/ChatGPT Image Nov 7, 2025, 12_11_34 PM.png"
-    # 3) Allow dev uploading if needed (not persisted across runs)
-    uploaded_logo = st.file_uploader("Upload logo (optional, for dev)", type=["png","jpg","jpeg"])
-
-    logo_to_show = None
-    logo_source = None
-
-    if uploaded_logo is not None:
-        try:
-            logo_bytes = uploaded_logo.read()
-            logo_to_show = logo_bytes
-            logo_source = "uploaded"
-        except Exception:
-            logo_to_show = None
-
-    if logo_to_show is None and os.path.exists(repo_logo):
-        logo_to_show = repo_logo
-        logo_source = "repo"
-    elif logo_to_show is None and os.path.exists(provided_path):
-        logo_to_show = provided_path
-        logo_source = "provided"
-
-    # Display helpful diagnostics in the UI so you can see what's happening:
-    st.markdown("<div style='color:#9fb0d8; font-size:12px;'>Logo debug:</div>", unsafe_allow_html=True)
-    st.text(f"Repo path: {repo_logo} (exists: {os.path.exists(repo_logo)})")
-    st.text(f"Provided path: {provided_path} (exists: {os.path.exists(provided_path)})")
-    if uploaded_logo is not None:
-        st.text("Uploaded logo present (will use uploaded file)")
-
-    if logo_to_show:
-        try:
-            # If it's raw bytes (uploaded), pass bytes; else pass path
-            st.image(logo_to_show, caption="Fayos Marvel logo", use_column_width=True)
-            st.success(f"Logo loaded from: {logo_source}")
-        except Exception as e:
-            st.error(f"Logo could not be displayed: {e}")
-    else:
-        st.warning("Logo could not be loaded. Place logo at ./assets/logo.png or upload it using the uploader above.")
+    # small decorative image or logo repeat
+    if os.path.exists(local_logo):
+        st.image(local_logo, use_column_width=True)
+    elif os.path.exists(fallback):
+        st.image(fallback, use_column_width=True)
 
 # show top message if any
 if st.session_state.get("message"):
@@ -626,8 +650,10 @@ if st.session_state.get("message"):
 
 page = current_page()
 
+# ----------------------------
+# Pages: signup / login / dashboard / settings / account
+# ----------------------------
 if page == "signup":
-    # Signup page layout
     col1, col2 = st.columns([1, 1])
     with col1:
         st.header("Create account")
@@ -732,11 +758,24 @@ elif page == "login":
         else:
             with st.spinner("Signing in..."):
                 ok, payload = sign_in_user(login_email.strip(), login_password)
-                # DEBUG: uncomment to inspect payload when debugging
-                # if st.secrets.get("DEBUG","") == "1":
-                #     st.write("sign-in payload:", payload)
                 if not ok:
                     st.error(f"Login failed: {payload}")
+                    # show quick action buttons
+                    colx, coly = st.columns(2)
+                    with colx:
+                        if st.button("Resend confirmation email"):
+                            ok2, msg2 = resend_confirmation(login_email.strip())
+                            if ok2:
+                                st.success(msg2)
+                            else:
+                                st.error(msg2)
+                    with coly:
+                        if st.button("Forgot password / Reset"):
+                            ok3, msg3 = send_password_reset(login_email.strip())
+                            if ok3:
+                                st.success(msg3)
+                            else:
+                                st.error(msg3)
                 else:
                     st.session_state["logged_in"] = True
                     st.session_state["user_email"] = login_email.strip()
@@ -839,6 +878,37 @@ elif page == "dashboard":
                             st.text("No image path available for preview.")
                     except Exception:
                         st.text("Could not preview the latest image.")
+
+elif page == "settings":
+    if not st.session_state.get("logged_in"):
+        st.warning("Please log in to access settings.")
+        go_to_page("login")
+    else:
+        st.header("Settings")
+        st.write("Update app settings and preferences here.")
+        with st.form("settings_form"):
+            display_name = st.text_input("Display name", value=st.session_state.get("user_email") or "")
+            save = st.form_submit_button("Save settings")
+        if save:
+            try:
+                res = supabase.table("users").update({"display_name": display_name}).eq("email", st.session_state.get("user_email")).execute()
+                ok, data, err = _parse_supabase_response(res)
+                if ok:
+                    st.success("Settings updated.")
+                else:
+                    st.error(f"Could not save settings: {err}")
+            except Exception as e:
+                st.error(f"Error saving settings: {e}")
+
+elif page == "account":
+    if not st.session_state.get("logged_in"):
+        st.warning("Please log in to view account.")
+        go_to_page("login")
+    else:
+        st.header("Account")
+        st.write(f"Signed in as: **{st.session_state.get('user_email')}**")
+        if st.button("Logout"):
+            do_logout()
 
 else:
     st.info("Unknown page. Returning to signup.")
