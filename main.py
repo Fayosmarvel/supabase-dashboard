@@ -1,7 +1,8 @@
-# app.py - Streamlit + Supabase
+# app.py
 import os
 import re
 import io
+import sys
 import base64
 from datetime import datetime
 from uuid import uuid4
@@ -12,14 +13,14 @@ import pandas as pd
 from PIL import Image
 
 # ----------------------------
-# Read secrets from Streamlit
+# Read secrets from Streamlit (or .streamlit/secrets.toml)
 # ----------------------------
 try:
     SUPABASE_URL = st.secrets["SUPABASE_URL"]
     SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
     BUCKET_NAME = st.secrets.get("SUPABASE_BUCKET", "id_uploads")
     ADMIN_KEY = st.secrets.get("ADMIN_KEY", "")
-except Exception as e:
+except Exception:
     st.error("Supabase secrets not found. Add SUPABASE_URL and SUPABASE_KEY in Streamlit Secrets.")
     st.stop()
 
@@ -27,7 +28,7 @@ except Exception as e:
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ----------------------------
-# Helpers (kept from your original code)
+# Helpers
 # ----------------------------
 EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -37,6 +38,10 @@ def is_valid_email(email: str) -> bool:
 
 
 def _parse_supabase_response(res):
+    """
+    Normalize different supabase client responses into (ok: bool, data, error_message).
+    Handles objects with .data/.error, objects with .status_code/.data/.json, or plain dicts.
+    """
     try:
         if hasattr(res, "data") or hasattr(res, "error"):
             data = getattr(res, "data", None)
@@ -90,6 +95,10 @@ def _parse_supabase_response(res):
 
 
 def check_user_exists(email: str):
+    """
+    Return (exists: bool, reason: str).
+    Checks users table and common auth endpoints.
+    """
     # 1) Check users table first
     try:
         tbl_res = supabase.table("users").select("email").eq("email", email).limit(1).execute()
@@ -103,7 +112,7 @@ def check_user_exists(email: str):
     except Exception:
         pass
 
-    # 2) Try auth lookups (multiple shapes)
+    # 2) Try common auth lookups
     try:
         try:
             auth_res = supabase.auth.api.get_user_by_email(email)
@@ -146,7 +155,12 @@ def check_user_exists(email: str):
 
 
 def create_auth_user(email: str, password: str):
+    """
+    Create a Supabase Auth user using sign_up.
+    Returns (ok: bool, payload_or_error).
+    """
     attempts = []
+    # Attempt 1: dict-style
     try:
         res = supabase.auth.sign_up({"email": email, "password": password})
         ok, data, err = _parse_supabase_response(res)
@@ -156,6 +170,7 @@ def create_auth_user(email: str, password: str):
     except Exception as e:
         attempts.append(("dict-style-exception", str(e)))
 
+    # Attempt 2: positional args
     try:
         if hasattr(supabase.auth, "sign_up") and callable(supabase.auth.sign_up):
             res = supabase.auth.sign_up(email, password)
@@ -166,6 +181,7 @@ def create_auth_user(email: str, password: str):
     except Exception as e:
         attempts.append(("positional-exception", str(e)))
 
+    # Attempt 3: single-dict (email-only)
     try:
         res = supabase.auth.sign_up({"email": email})
         ok, data, err = _parse_supabase_response(res)
@@ -175,6 +191,7 @@ def create_auth_user(email: str, password: str):
     except Exception as e:
         attempts.append(("dict-email-only-exception", str(e)))
 
+    # Try to extract user/session if last res had those attributes
     try:
         if 'res' in locals() and (hasattr(res, "user") or hasattr(res, "session")):
             payload = {}
@@ -214,57 +231,80 @@ def create_auth_user(email: str, password: str):
 
 
 def sign_in_user(email: str, password: str):
+    """
+    Robust sign-in wrapper: tries modern sign_in_with_password and falls back.
+    Returns (ok: bool, payload_or_error_str).
+    """
     attempts = []
+
+    def _ok_or_err(res, label):
+        ok, data, err = _parse_supabase_response(res)
+        if ok:
+            payload = {}
+            if isinstance(data, dict) and ("user" in data or "session" in data):
+                payload = data
+            else:
+                try:
+                    if hasattr(res, "user") or hasattr(res, "session"):
+                        u = getattr(res, "user", None)
+                        s = getattr(res, "session", None)
+                        if u:
+                            payload["user"] = u
+                        if s:
+                            payload["session"] = s
+                except Exception:
+                    pass
+            return True, payload or data or "Signed in (no user/session payload found)"
+        else:
+            if err:
+                return False, str(err)
+            return False, f"Sign-in failed ({label}) - no error message returned."
+
+    # Preferred modern method
     try:
         if hasattr(supabase.auth, "sign_in_with_password"):
             res = supabase.auth.sign_in_with_password({"email": email, "password": password})
-            ok, data, err = _parse_supabase_response(res)
+            ok, payload_or_err = _ok_or_err(res, "sign_in_with_password")
             if ok:
-                return True, data
-            attempts.append(("sign_in_with_password-dict", err or data))
+                return True, payload_or_err
+            attempts.append(("sign_in_with_password", payload_or_err))
+        else:
+            attempts.append(("sign_in_with_password-missing", "method not available on client"))
     except Exception as e:
-        attempts.append(("sign_in_with_password-dict-ex", str(e)))
+        attempts.append(("sign_in_with_password-exception", str(e)))
 
+    # Fallback: sign_in dict
     try:
         if hasattr(supabase.auth, "sign_in"):
             res = supabase.auth.sign_in({"email": email, "password": password})
-            ok, data, err = _parse_supabase_response(res)
+            ok, payload_or_err = _ok_or_err(res, "sign_in-dict")
             if ok:
-                return True, data
-            attempts.append(("sign_in-dict", err or data))
+                return True, payload_or_err
+            attempts.append(("sign_in-dict", payload_or_err))
+        else:
+            attempts.append(("sign_in-dict-missing", "method not available"))
     except Exception as e:
         attempts.append(("sign_in-dict-ex", str(e)))
 
+    # Positional fallback
     try:
-        res = supabase.auth.sign_in(email, password)
-        ok, data, err = _parse_supabase_response(res)
-        if ok:
-            return True, data
-        attempts.append(("sign_in-positional", err or data))
+        if callable(getattr(supabase.auth, "sign_in", None)):
+            res = supabase.auth.sign_in(email, password)
+            ok, payload_or_err = _ok_or_err(res, "sign_in-positional")
+            if ok:
+                return True, payload_or_err
+            attempts.append(("sign_in-positional", payload_or_err))
     except Exception as e:
         attempts.append(("sign_in-positional-ex", str(e)))
-
-    try:
-        if 'res' in locals() and (hasattr(res, "user") or hasattr(res, "session")):
-            payload = {}
-            user_obj = getattr(res, "user", None)
-            if user_obj is not None:
-                if isinstance(user_obj, dict):
-                    payload["user"] = user_obj
-                else:
-                    payload["user"] = str(user_obj)
-            session_obj = getattr(res, "session", None)
-            if session_obj is not None:
-                payload["session"] = session_obj
-            if payload:
-                return True, payload
-    except Exception:
-        pass
 
     return False, f"All sign-in attempts failed. Attempts: {attempts}"
 
 
 def upload_id_image_to_storage(uploaded_file, path: str):
+    """
+    Robust upload helper for Supabase Storage that understands UploadResponse objects.
+    Returns (ok: bool, public_url_or_error_str).
+    """
     attempts = []
     try:
         file_bytes = uploaded_file.getvalue()
@@ -383,13 +423,11 @@ def do_logout():
     st.session_state["logged_in"] = False
     st.session_state["user_email"] = None
     st.session_state["message"] = "You have logged out."
-    # go back to signup page
-    st.experimental_set_query_params(page="signup")
-    st.experimental_rerun()
+    go_to_page("signup")
 
 
 # ----------------------------
-# Page routing helpers (query param based)
+# Page routing helpers (query param based) with defensive rerun
 # ----------------------------
 def current_page():
     params = st.experimental_get_query_params()
@@ -397,25 +435,49 @@ def current_page():
     return page
 
 def go_to_page(page_name: str):
-    st.experimental_set_query_params(page=page_name)
-    st.experimental_rerun()
+    """
+    Navigate using query params and request a rerun.
+    Safe if the file is executed directly (falls back to sys.exit).
+    """
+    try:
+        st.experimental_set_query_params(page=page_name)
+    except Exception:
+        # ignore if running older streamlit or outside of streamlit
+        pass
+
+    try:
+        st.experimental_rerun()
+    except Exception as exc:
+        print(f"Requested rerun for page={page_name} (fallback exit): {exc}")
+        sys.exit(0)
 
 
 # ----------------------------
 # UI / Pages
 # ----------------------------
-st.set_page_config(page_title="Fayos Marvel Company & CO", layout="wide")
-page = current_page()
+st.set_page_config(page_title="Fayos Marvel Tech Company", layout="wide")
 
-# top message
+# Header: company name and provided write-up
+st.title("fayos marvel tech company")
+st.markdown(
+    "Fayos Marvel tech company is a leading IT services provider, \n"
+    "dedicated to delivering innovative technology solutions to \n"
+    "drive business growth and efficieny. "
+    "\n Our expertise spans IT infrasture management, cybersecutity, \n"
+    "cloud computing, and software developmet"
+)
+
+# show top message if any
 if st.session_state.get("message"):
     st.info(st.session_state["message"])
 
+page = current_page()
+
 if page == "signup":
-    # --- Signup page (left) and quick info or link to login (right) ---
+    # Signup page layout
     col1, col2 = st.columns([1, 1])
     with col1:
-        st.title("Create account")
+        st.header("Create account")
         with st.form("signup_form"):
             email = st.text_input("Email", key="signup_email")
             password = st.text_input("Create password", type="password", key="signup_password")
@@ -490,7 +552,6 @@ if page == "signup":
                                 else:
                                     st.success("Account created and metadata saved! ✅")
                                     st.info("Now please log in from the Login page.")
-                                    st.markdown("👉 [Go to Login](#)", unsafe_allow_html=True)
                                     if st.button("Go to Login page"):
                                         go_to_page("login")
 
@@ -505,7 +566,6 @@ if page == "signup":
             go_to_page("login")
 
 elif page == "login":
-    # --- Separate login page ---
     st.title("Login")
     st.write("Enter your email and password to sign in.")
     with st.form("login_form_page"):
@@ -519,6 +579,7 @@ elif page == "login":
         else:
             with st.spinner("Signing in..."):
                 ok, payload = sign_in_user(login_email.strip(), login_password)
+                # DEBUG: if you want to inspect payload use st.write(payload)
                 if not ok:
                     st.error(f"Login failed: {payload}")
                 else:
@@ -532,7 +593,6 @@ elif page == "login":
         go_to_page("signup")
 
 elif page == "dashboard":
-    # --- Dashboard page (only viewable when logged in) ---
     if not st.session_state.get("logged_in"):
         st.warning("You must be logged in to view the dashboard. Redirecting to login...")
         go_to_page("login")
