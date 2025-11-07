@@ -232,72 +232,126 @@ def create_auth_user(email: str, password: str):
 
 def sign_in_user(email: str, password: str):
     """
-    Robust sign-in wrapper: tries modern sign_in_with_password and falls back.
-    Returns (ok: bool, payload_or_error_str).
+    Robust sign-in wrapper. Returns (ok: bool, payload_or_error_str).
+
+    - Calls modern sign_in_with_password when available.
+    - On failure, checks whether the email exists and whether email is confirmed,
+      and returns actionable suggestions (reset password / confirm email).
+    - If DEBUG is enabled in st.secrets (DEBUG="1"), raw responses are also shown.
     """
     attempts = []
 
-    def _ok_or_err(res, label):
+    def _parse_and_return(res, label):
         ok, data, err = _parse_supabase_response(res)
+        # debug dump when enabled
+        if st.secrets.get("DEBUG", "") == "1":
+            st.write(f"DEBUG sign-in raw ({label}):", repr(res))
+            st.write("DEBUG parsed:", ok, data, err)
         if ok:
-            payload = {}
+            # prefer to return user/session info if present
             if isinstance(data, dict) and ("user" in data or "session" in data):
-                payload = data
-            else:
-                try:
-                    if hasattr(res, "user") or hasattr(res, "session"):
-                        u = getattr(res, "user", None)
-                        s = getattr(res, "session", None)
-                        if u:
-                            payload["user"] = u
-                        if s:
-                            payload["session"] = s
-                except Exception:
-                    pass
-            return True, payload or data or "Signed in (no user/session payload found)"
+                return True, data
+            # sometimes res has attributes
+            try:
+                payload = {}
+                if hasattr(res, "user"):
+                    payload["user"] = getattr(res, "user")
+                if hasattr(res, "session"):
+                    payload["session"] = getattr(res, "session")
+                if payload:
+                    return True, payload
+            except Exception:
+                pass
+            return True, data or "Signed in (no user/session payload found)"
         else:
-            if err:
-                return False, str(err)
-            return False, f"Sign-in failed ({label}) - no error message returned."
+            return False, str(err) if err else f"Sign-in failed ({label}) - no error message."
 
-    # Preferred modern method
+    # 1) Modern call
     try:
         if hasattr(supabase.auth, "sign_in_with_password"):
             res = supabase.auth.sign_in_with_password({"email": email, "password": password})
-            ok, payload_or_err = _ok_or_err(res, "sign_in_with_password")
+            ok, out = _parse_and_return(res, "sign_in_with_password")
             if ok:
-                return True, payload_or_err
-            attempts.append(("sign_in_with_password", payload_or_err))
+                return True, out
+            attempts.append(("sign_in_with_password", out))
         else:
-            attempts.append(("sign_in_with_password-missing", "method not available on client"))
+            attempts.append(("sign_in_with_password-missing", "method not available"))
     except Exception as e:
         attempts.append(("sign_in_with_password-exception", str(e)))
 
-    # Fallback: sign_in dict
+    # 2) Fallback older shapes (if present)
     try:
         if hasattr(supabase.auth, "sign_in"):
-            res = supabase.auth.sign_in({"email": email, "password": password})
-            ok, payload_or_err = _ok_or_err(res, "sign_in-dict")
-            if ok:
-                return True, payload_or_err
-            attempts.append(("sign_in-dict", payload_or_err))
+            try:
+                res = supabase.auth.sign_in({"email": email, "password": password})
+                ok, out = _parse_and_return(res, "sign_in-dict")
+                if ok:
+                    return True, out
+                attempts.append(("sign_in-dict", out))
+            except Exception as e:
+                attempts.append(("sign_in-dict-ex", str(e)))
         else:
             attempts.append(("sign_in-dict-missing", "method not available"))
     except Exception as e:
-        attempts.append(("sign_in-dict-ex", str(e)))
+        attempts.append(("sign_in-dict-ex2", str(e)))
 
-    # Positional fallback
+    # All sign-in attempts failed — provide helpful guidance
+    # Check if the user exists and whether they confirmed their email
+    exists, reason = False, "unknown"
     try:
-        if callable(getattr(supabase.auth, "sign_in", None)):
-            res = supabase.auth.sign_in(email, password)
-            ok, payload_or_err = _ok_or_err(res, "sign_in-positional")
-            if ok:
-                return True, payload_or_err
-            attempts.append(("sign_in-positional", payload_or_err))
-    except Exception as e:
-        attempts.append(("sign_in-positional-ex", str(e)))
+        exists, reason = check_user_exists(email)
+    except Exception:
+        exists, reason = False, "check_user_exists failed"
 
-    return False, f"All sign-in attempts failed. Attempts: {attempts}"
+    # try to fetch auth user info to examine confirmation status (best-effort)
+    email_confirmed = None
+    try:
+        # Many clients expose admin or api methods — try both
+        auth_user = None
+        try:
+            auth_user = supabase.auth.api.get_user_by_email(email)
+        except Exception:
+            pass
+        if not auth_user:
+            try:
+                auth_user = supabase.auth.admin.get_user_by_email(email)
+            except Exception:
+                pass
+        # parse
+        ok2, data2, err2 = _parse_supabase_response(auth_user) if auth_user is not None else (False, None, None)
+        if ok2 and data2:
+            # data2 might be the user dict or wrapped in 'user'
+            u = None
+            if isinstance(data2, dict):
+                if data2.get("email"):
+                    u = data2
+                elif "user" in data2 and isinstance(data2["user"], dict):
+                    u = data2["user"]
+            if isinstance(u, dict):
+                email_confirmed = bool(u.get("email_confirmed_at") or u.get("confirmed_at") or u.get("email_confirmed"))
+    except Exception:
+        email_confirmed = None
+
+    # Compose final friendly message
+    msg_parts = []
+    # give raw attempts summary (concise)
+    msg_parts.append("Unable to sign in. Reason(s):")
+    for k, v in attempts:
+        msg_parts.append(f"- {k}: {v}")
+
+    if exists:
+        if email_confirmed is False:
+            msg_parts.append("- Your account exists but the email is not confirmed. Check your inbox for the confirmation email or enable confirmation in Supabase settings.")
+        else:
+            msg_parts.append("- The email exists. Most likely the password is incorrect. Try resetting your password.")
+            msg_parts.append("  You can reset your password from the Supabase dashboard (Auth → Users → Reset password) or implement a 'Forgot password' flow.")
+    else:
+        msg_parts.append("- No account found for that email. Create a new account or verify the email address used during signup.")
+
+    # Add a short actionable tip
+    msg_parts.append("If you're testing, you can also create a test user directly in the Supabase dashboard and try logging in with that user's credentials.")
+    final_msg = "\n".join(msg_parts)
+    return False, final_msg
 
 
 def upload_id_image_to_storage(uploaded_file, path: str):
@@ -455,17 +509,80 @@ def go_to_page(page_name: str):
 # ----------------------------
 # UI / Pages
 # ----------------------------
+# -- hero / header (two-column card with provided logo) --
 st.set_page_config(page_title="Fayos Marvel Tech Company", layout="wide")
 
-# Header: company name and provided write-up
-st.title("fayos marvel tech company")
+# CSS for the hero card
 st.markdown(
-    "Fayos Marvel tech company is a leading IT services provider, \n"
-    "dedicated to delivering innovative technology solutions to \n"
-    "drive business growth and efficieny. "
-    "\n Our expertise spans IT infrasture management, cybersecutity, \n"
-    "cloud computing, and software developmet"
+    """
+    <style>
+    .hero-card {
+        display: flex;
+        gap: 16px;
+        align-items: center;
+        padding: 18px;
+        border-radius: 12px;
+        background: linear-gradient(90deg, rgba(255,255,255,0.96), rgba(245,247,250,0.96));
+        box-shadow: 0 6px 18px rgba(16,24,40,0.06);
+    }
+    .hero-title {
+        font-size: 28px;
+        font-weight: 800;
+        margin: 0 0 8px 0;
+        text-transform: capitalize;
+    }
+    .hero-sub {
+        margin: 0 0 12px 0;
+        color: #334155;
+        line-height: 1.45;
+    }
+    .hero-ctas { display:flex; gap:10px; margin-top:8px; }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
+
+left_col, right_col = st.columns([2.6, 1.4])
+
+with left_col:
+    st.markdown(
+        """
+        <div class="hero-card">
+          <div style="flex:1">
+            <h1 class="hero-title">fayos marvel tech company</h1>
+            <div class="hero-sub">
+              Fayos Marvel tech company is a leading IT services provider,
+              dedicated to delivering innovative technology solutions to
+              drive business growth and efficiency.<br><br>
+              Our expertise spans IT infrastructure management, cybersecurity,
+              cloud computing, and software development.
+            </div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    c1, c2, c3 = st.columns([1, 1, 1])
+    with c1:
+        if st.button("Create account"):
+            go_to_page("signup")
+    with c2:
+        if st.button("Login"):
+            go_to_page("login")
+    with c3:
+        if st.button("Learn more"):
+            st.info("We provide IT infrastructure, cloud, security, and software services. Contact us to learn more.")
+
+with right_col:
+    # Use the uploaded image path you provided. If you move the file, update this path.
+    company_img_path = "/mnt/data/ChatGPT Image Nov 7, 2025, 12_11_34 PM.png"
+    try:
+        st.image(company_img_path, caption="Fayos Marvel logo", use_column_width=True)
+    except Exception as e:
+        # fallback to text title on error
+        st.error("Logo could not be loaded. Check the image path.")
+        st.markdown("**Fayos Marvel Tech Company**")
 
 # show top message if any
 if st.session_state.get("message"):
@@ -579,7 +696,9 @@ elif page == "login":
         else:
             with st.spinner("Signing in..."):
                 ok, payload = sign_in_user(login_email.strip(), login_password)
-                # DEBUG: if you want to inspect payload use st.write(payload)
+                # DEBUG: uncomment to inspect payload when debugging
+                # if st.secrets.get("DEBUG","") == "1":
+                #     st.write("sign-in payload:", payload)
                 if not ok:
                     st.error(f"Login failed: {payload}")
                 else:
