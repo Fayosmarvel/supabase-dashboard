@@ -157,9 +157,31 @@ def create_auth_user(email: str, password: str):
     """
     Create a Supabase Auth user using sign_up.
     Returns (ok: bool, payload_or_error).
+    Behavior:
+      - If the email already exists, returns a clear message instead of repeatedly attempting sign_up.
+      - Tries safe call shapes: dict-style and keyword-args (avoids the problematic positional call).
     """
+    # 0) Quick validation
+    if not email or not password:
+        return False, "Email and password are required."
+
+    # 1) If user already exists, short-circuit with helpful guidance
+    try:
+        exists, reason = check_user_exists(email)
+        if exists:
+            # Provide actionable guidance instead of attempting sign_up again
+            msg = (
+                "User already registered. If this is your account, please use 'Forgot password' to reset the password "
+                "or click 'Resend confirmation email' if you haven't confirmed your address yet."
+            )
+            return False, msg
+    except Exception:
+        # If the existence check fails, continue but keep a note
+        pass
+
     attempts = []
-    # Attempt 1: dict-style
+
+    # Attempt 1: dict-style (preferred)
     try:
         res = supabase.auth.sign_up({"email": email, "password": password})
         ok, data, err = _parse_supabase_response(res)
@@ -169,18 +191,21 @@ def create_auth_user(email: str, password: str):
     except Exception as e:
         attempts.append(("dict-style-exception", str(e)))
 
-    # Attempt 2: positional args
+    # Attempt 2: keyword-args (some clients accept named args)
     try:
-        if hasattr(supabase.auth, "sign_up") and callable(supabase.auth.sign_up):
-            res = supabase.auth.sign_up(email, password)
-            ok, data, err = _parse_supabase_response(res)
-            if ok:
-                return True, data
-            attempts.append(("positional", err or data))
+        # use keyword args to avoid positional-argument arity problems
+        res = supabase.auth.sign_up(email=email, password=password)
+        ok, data, err = _parse_supabase_response(res)
+        if ok:
+            return True, data
+        attempts.append(("keyword-args", err or data))
+    except TypeError as te:
+        # If the client truly doesn't support keywords, record and continue
+        attempts.append(("keyword-args-typeerror", str(te)))
     except Exception as e:
-        attempts.append(("positional-exception", str(e)))
+        attempts.append(("keyword-args-exception", str(e)))
 
-    # Attempt 3: single-dict (email-only)
+    # Attempt 3: Some GoTrue clients offer a single-dict with options
     try:
         res = supabase.auth.sign_up({"email": email})
         ok, data, err = _parse_supabase_response(res)
@@ -190,7 +215,7 @@ def create_auth_user(email: str, password: str):
     except Exception as e:
         attempts.append(("dict-email-only-exception", str(e)))
 
-    # Try to extract user/session if last res had those attributes
+    # If we have a last 'res' object containing user/session attrs, try to extract
     try:
         if 'res' in locals() and (hasattr(res, "user") or hasattr(res, "session")):
             payload = {}
