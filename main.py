@@ -1,3 +1,4 @@
+# app.py - Streamlit + Supabase
 import os
 import re
 import io
@@ -13,8 +14,6 @@ from PIL import Image
 # ----------------------------
 # Read secrets from Streamlit
 # ----------------------------
-# Streamlit Cloud provides st.secrets; local dev can set a local secrets.toml or fallback to env vars if you prefer.
-# Example (local): create a file .streamlit/secrets.toml with the same keys for local testing.
 try:
     SUPABASE_URL = st.secrets["SUPABASE_URL"]
     SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
@@ -28,7 +27,7 @@ except Exception as e:
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ----------------------------
-# Helpers
+# Helpers (kept from your original code)
 # ----------------------------
 EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -38,10 +37,6 @@ def is_valid_email(email: str) -> bool:
 
 
 def _parse_supabase_response(res):
-    """
-    Normalize different supabase client responses into (ok: bool, data, error_message).
-    Handles objects with .data/.error, objects with .status_code/.data/.json, or plain dicts.
-    """
     try:
         if hasattr(res, "data") or hasattr(res, "error"):
             data = getattr(res, "data", None)
@@ -95,12 +90,6 @@ def _parse_supabase_response(res):
 
 
 def check_user_exists(email: str):
-    """
-    Return (exists: bool, reason: str).
-    Checks:
-      1) users table for a matching email
-      2) Supabase Auth for an existing user with that email (tries multiple client shapes)
-    """
     # 1) Check users table first
     try:
         tbl_res = supabase.table("users").select("email").eq("email", email).limit(1).execute()
@@ -114,10 +103,8 @@ def check_user_exists(email: str):
     except Exception:
         pass
 
-    # 2) Check Auth service via common admin helpers (defensive)
-    # Try multiple possible client method shapes
+    # 2) Try auth lookups (multiple shapes)
     try:
-        # method: supabase.auth.api.get_user_by_email
         try:
             auth_res = supabase.auth.api.get_user_by_email(email)
             ok, data, err = _parse_supabase_response(auth_res)
@@ -126,7 +113,6 @@ def check_user_exists(email: str):
         except Exception:
             pass
 
-        # method: supabase.auth.admin.get_user_by_email
         try:
             auth_res = supabase.auth.admin.get_user_by_email(email)
             ok, data, err = _parse_supabase_response(auth_res)
@@ -135,7 +121,6 @@ def check_user_exists(email: str):
         except Exception:
             pass
 
-        # method: supabase.auth.get_user_by_email (some clients)
         try:
             auth_res = supabase.auth.get_user_by_email(email)
             ok, data, err = _parse_supabase_response(auth_res)
@@ -144,7 +129,6 @@ def check_user_exists(email: str):
         except Exception:
             pass
 
-        # method: list users (if available)
         try:
             users_list = supabase.auth.list_users()
             ok, data, err = _parse_supabase_response(users_list)
@@ -155,18 +139,6 @@ def check_user_exists(email: str):
         except Exception:
             pass
 
-        # Last resort: query auth.users via SQL may not be supported by all clients
-        try:
-            sql = f"""SELECT id FROM auth.users WHERE email = '{email.replace("'", "''")}' LIMIT 1;"""
-            # Many clients won't support raw SQL this way; ignore errors
-            if hasattr(supabase, "rpc"):
-                sql_res = supabase.rpc("sql", {"q": sql})
-                ok, data, err = _parse_supabase_response(sql_res)
-                if ok and data:
-                    return True, "Found in auth.users via SQL"
-        except Exception:
-            pass
-
     except Exception:
         pass
 
@@ -174,13 +146,7 @@ def check_user_exists(email: str):
 
 
 def create_auth_user(email: str, password: str):
-    """
-    Create a Supabase Auth user using sign_up.
-    Tries multiple call shapes to support different client versions.
-    Returns (ok: bool, payload_or_error).
-    """
     attempts = []
-    # Attempt 1: dict-style
     try:
         res = supabase.auth.sign_up({"email": email, "password": password})
         ok, data, err = _parse_supabase_response(res)
@@ -190,17 +156,16 @@ def create_auth_user(email: str, password: str):
     except Exception as e:
         attempts.append(("dict-style-exception", str(e)))
 
-    # Attempt 2: positional args
     try:
-        res = supabase.auth.sign_up(email, password)
-        ok, data, err = _parse_supabase_response(res)
-        if ok:
-            return True, data
-        attempts.append(("positional", err or data))
+        if hasattr(supabase.auth, "sign_up") and callable(supabase.auth.sign_up):
+            res = supabase.auth.sign_up(email, password)
+            ok, data, err = _parse_supabase_response(res)
+            if ok:
+                return True, data
+            attempts.append(("positional", err or data))
     except Exception as e:
         attempts.append(("positional-exception", str(e)))
 
-    # Attempt 3: single-dict (email-only)
     try:
         res = supabase.auth.sign_up({"email": email})
         ok, data, err = _parse_supabase_response(res)
@@ -210,17 +175,6 @@ def create_auth_user(email: str, password: str):
     except Exception as e:
         attempts.append(("dict-email-only-exception", str(e)))
 
-    # Attempt 4: single-positional (email only)
-    try:
-        res = supabase.auth.sign_up(email)
-        ok, data, err = _parse_supabase_response(res)
-        if ok:
-            return True, data
-        attempts.append(("positional-email-only", err or data))
-    except Exception as e:
-        attempts.append(("positional-email-only-exception", str(e)))
-
-    # Try to extract user/session if last res had those attributes
     try:
         if 'res' in locals() and (hasattr(res, "user") or hasattr(res, "session")):
             payload = {}
@@ -259,18 +213,64 @@ def create_auth_user(email: str, password: str):
     return False, f"All sign_up attempts failed. Attempts: {attempt_text}"
 
 
+def sign_in_user(email: str, password: str):
+    attempts = []
+    try:
+        if hasattr(supabase.auth, "sign_in_with_password"):
+            res = supabase.auth.sign_in_with_password({"email": email, "password": password})
+            ok, data, err = _parse_supabase_response(res)
+            if ok:
+                return True, data
+            attempts.append(("sign_in_with_password-dict", err or data))
+    except Exception as e:
+        attempts.append(("sign_in_with_password-dict-ex", str(e)))
+
+    try:
+        if hasattr(supabase.auth, "sign_in"):
+            res = supabase.auth.sign_in({"email": email, "password": password})
+            ok, data, err = _parse_supabase_response(res)
+            if ok:
+                return True, data
+            attempts.append(("sign_in-dict", err or data))
+    except Exception as e:
+        attempts.append(("sign_in-dict-ex", str(e)))
+
+    try:
+        res = supabase.auth.sign_in(email, password)
+        ok, data, err = _parse_supabase_response(res)
+        if ok:
+            return True, data
+        attempts.append(("sign_in-positional", err or data))
+    except Exception as e:
+        attempts.append(("sign_in-positional-ex", str(e)))
+
+    try:
+        if 'res' in locals() and (hasattr(res, "user") or hasattr(res, "session")):
+            payload = {}
+            user_obj = getattr(res, "user", None)
+            if user_obj is not None:
+                if isinstance(user_obj, dict):
+                    payload["user"] = user_obj
+                else:
+                    payload["user"] = str(user_obj)
+            session_obj = getattr(res, "session", None)
+            if session_obj is not None:
+                payload["session"] = session_obj
+            if payload:
+                return True, payload
+    except Exception:
+        pass
+
+    return False, f"All sign-in attempts failed. Attempts: {attempts}"
+
+
 def upload_id_image_to_storage(uploaded_file, path: str):
-    """
-    Robust upload helper for Supabase Storage that understands UploadResponse objects.
-    Returns (ok: bool, public_url_or_error_str).
-    """
     attempts = []
     try:
         file_bytes = uploaded_file.getvalue()
     except Exception as e:
         return False, f"Could not read uploaded file bytes: {e}"
 
-    # Try the simplest/most compatible upload calls (do NOT pass unsupported kwargs)
     upload_calls = [
         (lambda: supabase.storage.from_(BUCKET_NAME).upload(path, file_bytes), "bytes"),
         (lambda: supabase.storage.from_(BUCKET_NAME).upload(path, io.BytesIO(file_bytes)), "file-like"),
@@ -281,8 +281,6 @@ def upload_id_image_to_storage(uploaded_file, path: str):
         try:
             res = call_fn()
             last_res = res
-            # If res is an UploadResponse-like object, treat as success
-            # Try to extract path (path inside bucket) from common attributes
             inner_path = None
             try:
                 if hasattr(res, "path") and getattr(res, "path"):
@@ -294,17 +292,9 @@ def upload_id_image_to_storage(uploaded_file, path: str):
                         inner_path = fp[len(prefix):]
                     else:
                         inner_path = fp
-                elif hasattr(res, "fullPath") and getattr(res, "fullPath"):
-                    fp = getattr(res, "fullPath")
-                    prefix = f"{BUCKET_NAME}/"
-                    if isinstance(fp, str) and fp.startswith(prefix):
-                        inner_path = fp[len(prefix):]
-                    else:
-                        inner_path = fp
             except Exception:
                 inner_path = None
 
-            # If inner_path found, we can get the public URL
             if inner_path:
                 try:
                     url_res = supabase.storage.from_(BUCKET_NAME).get_public_url(inner_path)
@@ -318,7 +308,6 @@ def upload_id_image_to_storage(uploaded_file, path: str):
                 except Exception as e:
                     return True, f"Upload succeeded; exception obtaining public URL: {e}"
 
-            # If res is a dict-like and parser says ok, attempt to locate path inside it
             ok, data, err = _parse_supabase_response(res)
             attempts.append((desc, "parsed_ok" if ok else f"parsed_err: {err}"))
             if ok:
@@ -347,7 +336,6 @@ def upload_id_image_to_storage(uploaded_file, path: str):
             attempts.append((desc, f"exception: {e}"))
             continue
 
-    # All attempts failed — present a helpful diagnostic including last response repr
     debug_last = ""
     try:
         if last_res is not None:
@@ -382,185 +370,264 @@ def save_metadata_to_table(email: str, auth_user_id: str, is_adult: bool, image_
 
 
 # ----------------------------
-# UI
+# Session state init
 # ----------------------------
-st.set_page_config(page_title="Signup (Supabase Auth) & Dashboard", layout="wide")
-st.title("Signup (Supabase Auth) & Dashboard")
+if "logged_in" not in st.session_state:
+    st.session_state["logged_in"] = False
+if "user_email" not in st.session_state:
+    st.session_state["user_email"] = None
+if "message" not in st.session_state:
+    st.session_state["message"] = ""
 
-st.markdown(
-    "This app uses Supabase Auth to create accounts and Supabase Storage to store ID images. "
-    "Keep service keys secret in Streamlit Secrets."
-)
+def do_logout():
+    st.session_state["logged_in"] = False
+    st.session_state["user_email"] = None
+    st.session_state["message"] = "You have logged out."
+    # go back to signup page
+    st.experimental_set_query_params(page="signup")
+    st.experimental_rerun()
 
-col1, col2 = st.columns([1, 1])
 
-with col1:
-    st.header("Create account")
-    with st.form("signup_form"):
-        email = st.text_input("Email")
-        password = st.text_input("Create password", type="password")
-        confirm_password = st.text_input("Confirm password", type="password")
-        is_18_or_older = st.checkbox("I confirm I am 18 years old or older")
-        id_image = st.file_uploader("Upload a photo of your ID (jpg/png)", type=["png", "jpg", "jpeg"])
-        submitted = st.form_submit_button("Sign up")
+# ----------------------------
+# Page routing helpers (query param based)
+# ----------------------------
+def current_page():
+    params = st.experimental_get_query_params()
+    page = params.get("page", ["signup"])[0]
+    return page
 
-    if submitted:
-        errors = []
-        if not email or not email.strip():
-            errors.append("Email is required.")
-        elif not is_valid_email(email.strip()):
-            errors.append("Please enter a valid email.")
+def go_to_page(page_name: str):
+    st.experimental_set_query_params(page=page_name)
+    st.experimental_rerun()
 
-        if not password:
-            errors.append("Password is required.")
-        elif len(password) < 8:
-            errors.append("Password must be at least 8 characters long.")
 
-        if password != confirm_password:
-            errors.append("Passwords do not match.")
+# ----------------------------
+# UI / Pages
+# ----------------------------
+st.set_page_config(page_title="Fayos Marvel Company & CO", layout="wide")
+page = current_page()
 
-        if not is_18_or_older:
-            errors.append("You must confirm you are 18+ to sign up.")
+# top message
+if st.session_state.get("message"):
+    st.info(st.session_state["message"])
 
-        if not id_image:
-            errors.append("An ID image is required.")
+if page == "signup":
+    # --- Signup page (left) and quick info or link to login (right) ---
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        st.title("Create account")
+        with st.form("signup_form"):
+            email = st.text_input("Email", key="signup_email")
+            password = st.text_input("Create password", type="password", key="signup_password")
+            confirm_password = st.text_input("Confirm password", type="password", key="signup_confirm")
+            is_18_or_older = st.checkbox("I confirm I am 18 years old or older", key="signup_age")
+            id_image = st.file_uploader("Upload a photo of your ID (jpg/png)", type=["png", "jpg", "jpeg"], key="signup_id")
+            submitted = st.form_submit_button("Sign up")
 
-        if errors:
-            for e in errors:
-                st.error(e)
-        else:
-            # --- NEW: check for existing account first ---
-            exists, reason = check_user_exists(email.strip())
-            if exists:
-                st.error("Account already exists for that email. Please use password reset (or sign in).")
+        if submitted:
+            errors = []
+            if not email or not email.strip():
+                errors.append("Email is required.")
+            elif not is_valid_email(email.strip()):
+                errors.append("Please enter a valid email.")
+
+            if not password:
+                errors.append("Password is required.")
+            elif len(password) < 8:
+                errors.append("Password must be at least 8 characters long.")
+
+            if password != confirm_password:
+                errors.append("Passwords do not match.")
+
+            if not is_18_or_older:
+                errors.append("You must confirm you are 18+ to sign up.")
+
+            if not id_image:
+                errors.append("An ID image is required.")
+
+            if errors:
+                for e in errors:
+                    st.error(e)
             else:
-                with st.spinner("Creating account and uploading ID..."):
-                    ok, payload = create_auth_user(email.strip(), password)
-                    if not ok:
-                        st.error(f"Failed to create Auth user: {payload}")
-                    else:
-                        # Try to extract auth user id from payload
-                        auth_user_id = None
-                        if isinstance(payload, dict):
-                            if "user" in payload and isinstance(payload["user"], dict):
-                                auth_user_id = payload["user"].get("id") or payload["user"].get("sub")
-                            elif "data" in payload and isinstance(payload["data"], dict) and "user" in payload["data"]:
-                                auth_user_id = payload["data"]["user"].get("id") or payload["data"]["user"].get("sub")
-                            elif "id" in payload:
-                                auth_user_id = payload.get("id")
-                            else:
-                                for v in payload.values():
-                                    if isinstance(v, dict) and "id" in v:
-                                        auth_user_id = v.get("id")
-                                        break
-                        if not auth_user_id:
-                            # fallback: synthetic id (not ideal but keeps flow)
-                            auth_user_id = str(uuid4())
-
-                        # Build storage path and upload
-                        filename = id_image.name if hasattr(id_image, "name") else f"id_{uuid4().hex}.jpg"
-                        timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-                        path = f"users/{auth_user_id}/{timestamp}_{filename}"
-
-                        ok_upload, upload_resp = upload_id_image_to_storage(id_image, path)
-                        if not ok_upload:
-                            st.error(f"Failed to upload ID image: {upload_resp}")
-                        else:
-                            image_public_url = upload_resp
-                            ok_meta, meta_resp = save_metadata_to_table(email.strip(), auth_user_id, is_18_or_older, path, image_public_url)
-                            if not ok_meta:
-                                st.error(f"Failed to save metadata: {meta_resp}")
-                            else:
-                                st.success("Account created and metadata saved!")
-
-with col2:
-    st.header("Dashboard (users)")
-    # Robust fetch: try to select expected columns, fallback if DB doesn't have them
-    try:
-        users_res = supabase.table("users").select("email,auth_user_id,is_adult,created_at,id_image_public_url").order("created_at", desc=True).limit(500).execute()
-        ok, data, err = _parse_supabase_response(users_res)
-        if not ok:
-            err_str = str(err) if err is not None else ""
-            if "does not exist" in err_str or "column" in err_str:
-                # fallback to select all
-                users_res = supabase.table("users").select("*").order("created_at", desc=True).limit(500).execute()
-                ok2, data2, err2 = _parse_supabase_response(users_res)
-                if not ok2:
-                    st.error(f"Failed to load users after fallback: {err2}")
-                    users_df = pd.DataFrame()
+                exists, reason = check_user_exists(email.strip())
+                if exists:
+                    st.error("Account already exists for that email. Please use password reset (or sign in).")
                 else:
-                    users = data2 or []
-                    if isinstance(users, dict) and "data" in users:
-                        users = users.get("data") or []
-                    users_df = pd.DataFrame(users)
-            else:
-                st.error(f"Failed to load users: {err}")
-                users_df = pd.DataFrame()
-        else:
-            users = data or []
-            if isinstance(users, dict) and "data" in users:
-                users = users.get("data") or []
-            users_df = pd.DataFrame(users)
-
-        if not users_df.empty and "created_at" in users_df.columns:
-            users_df["created_at"] = pd.to_datetime(users_df["created_at"], utc=True)
-    except Exception as e:
-        st.error(f"Exception fetching users: {e}")
-        users_df = pd.DataFrame()
-
-    # Metrics
-    col_a, col_b, col_c = st.columns(3)
-    total_users = len(users_df)
-    adults = int(users_df["is_adult"].sum()) if (not users_df.empty and "is_adult" in users_df.columns) else 0
-    non_adults = total_users - adults
-
-    col_a.metric("Total users", total_users)
-    col_b.metric("18+ users", adults)
-    col_c.metric("Under 18 (reported)", non_adults)
-
-    st.subheader("Recent signups")
-    if users_df.empty:
-        st.info("No user records found yet.")
-    else:
-        recent_cols = [c for c in ["email", "auth_user_id", "is_adult", "created_at"] if c in users_df.columns]
-        st.dataframe(users_df.loc[:, recent_cols].head(20))
-
-        st.subheader("Latest ID preview")
-        if "id_image_public_url" in users_df.columns:
-            latest_with_image = users_df[users_df["id_image_public_url"].notnull() & (users_df["id_image_public_url"] != "")]
-        elif "id_image_path" in users_df.columns:
-            # In case only path is stored (no public URL), attempt to create a public URL pattern
-            latest_with_image = users_df[users_df["id_image_path"].notnull() & (users_df["id_image_path"] != "")]
-        else:
-            latest_with_image = pd.DataFrame()
-
-        if not latest_with_image.empty:
-            if "id_image_public_url" in latest_with_image.columns:
-                latest_url = latest_with_image.iloc[0]["id_image_public_url"]
-                try:
-                    st.image(latest_url, caption="Latest uploaded ID (public URL)", use_column_width=True)
-                except Exception:
-                    st.text("Could not load latest image via public URL.")
-            else:
-                # try to construct a public url from path using client (best-effort)
-                try:
-                    row = latest_with_image.iloc[0]
-                    path = row.get("id_image_path")
-                    if path:
-                        url_res = supabase.storage.from_(BUCKET_NAME).get_public_url(path)
-                        oku, datu, erru = _parse_supabase_response(url_res)
-                        if oku:
-                            if isinstance(datu, dict):
-                                pub = datu.get("publicUrl") or datu.get("publicURL") or datu.get("public_url") or str(datu)
-                            else:
-                                pub = str(datu)
-                            st.image(pub, caption="Latest uploaded ID (constructed URL)", use_column_width=True)
+                    with st.spinner("Creating account and uploading ID..."):
+                        ok, payload = create_auth_user(email.strip(), password)
+                        if not ok:
+                            st.error(f"Failed to create Auth user: {payload}")
                         else:
-                            st.text("Could not construct public URL for latest image.")
+                            # extract auth_user_id as best-effort
+                            auth_user_id = None
+                            if isinstance(payload, dict):
+                                if "user" in payload and isinstance(payload["user"], dict):
+                                    auth_user_id = payload["user"].get("id") or payload["user"].get("sub")
+                                elif "data" in payload and isinstance(payload["data"], dict) and "user" in payload["data"]:
+                                    auth_user_id = payload["data"]["user"].get("id") or payload["data"]["user"].get("sub")
+                                elif "id" in payload:
+                                    auth_user_id = payload.get("id")
+                                else:
+                                    for v in payload.values():
+                                        if isinstance(v, dict) and "id" in v:
+                                            auth_user_id = v.get("id")
+                                            break
+                            if not auth_user_id:
+                                auth_user_id = str(uuid4())
+
+                            filename = id_image.name if hasattr(id_image, "name") else f"id_{uuid4().hex}.jpg"
+                            timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+                            path = f"users/{auth_user_id}/{timestamp}_{filename}"
+
+                            ok_upload, upload_resp = upload_id_image_to_storage(id_image, path)
+                            if not ok_upload:
+                                st.error(f"Failed to upload ID image: {upload_resp}")
+                            else:
+                                image_public_url = upload_resp
+                                ok_meta, meta_resp = save_metadata_to_table(email.strip(), auth_user_id, is_18_or_older, path, image_public_url)
+                                if not ok_meta:
+                                    st.error(f"Failed to save metadata: {meta_resp}")
+                                else:
+                                    st.success("Account created and metadata saved! ✅")
+                                    st.info("Now please log in from the Login page.")
+                                    st.markdown("👉 [Go to Login](#)", unsafe_allow_html=True)
+                                    if st.button("Go to Login page"):
+                                        go_to_page("login")
+
+    with col2:
+        st.header("Why sign up?")
+        st.write(
+            "After you create an account, you must return to the Login page and sign in using the password you chose. "
+            "Only after a successful login will you be able to view the dashboard."
+        )
+        st.write("If you already have an account, go to the Login page:")
+        if st.button("Go to Login"):
+            go_to_page("login")
+
+elif page == "login":
+    # --- Separate login page ---
+    st.title("Login")
+    st.write("Enter your email and password to sign in.")
+    with st.form("login_form_page"):
+        login_email = st.text_input("Email", key="page_login_email")
+        login_password = st.text_input("Password", type="password", key="page_login_password")
+        login_submitted = st.form_submit_button("Login")
+
+    if login_submitted:
+        if not login_email or not login_password:
+            st.error("Email and password are required to login.")
+        else:
+            with st.spinner("Signing in..."):
+                ok, payload = sign_in_user(login_email.strip(), login_password)
+                if not ok:
+                    st.error(f"Login failed: {payload}")
+                else:
+                    st.session_state["logged_in"] = True
+                    st.session_state["user_email"] = login_email.strip()
+                    st.session_state["message"] = f"Welcome, {login_email.strip()}!"
+                    go_to_page("dashboard")
+
+    st.markdown("---")
+    if st.button("Back to Sign up"):
+        go_to_page("signup")
+
+elif page == "dashboard":
+    # --- Dashboard page (only viewable when logged in) ---
+    if not st.session_state.get("logged_in"):
+        st.warning("You must be logged in to view the dashboard. Redirecting to login...")
+        go_to_page("login")
+    else:
+        st.header(f"Dashboard (users) — Logged in as {st.session_state.get('user_email')}")
+        if st.button("Logout"):
+            do_logout()
+
+        # Robust fetch: try to select expected columns, fallback if DB doesn't have them
+        try:
+            users_res = supabase.table("users").select("email,auth_user_id,is_adult,created_at,id_image_public_url").order("created_at", desc=True).limit(500).execute()
+            ok, data, err = _parse_supabase_response(users_res)
+            if not ok:
+                err_str = str(err) if err is not None else ""
+                if "does not exist" in err_str or "column" in err_str:
+                    users_res = supabase.table("users").select("*").order("created_at", desc=True).limit(500).execute()
+                    ok2, data2, err2 = _parse_supabase_response(users_res)
+                    if not ok2:
+                        st.error(f"Failed to load users after fallback: {err2}")
+                        users_df = pd.DataFrame()
                     else:
-                        st.text("No image path available for preview.")
-                except Exception:
-                    st.text("Could not preview the latest image.")
+                        users = data2 or []
+                        if isinstance(users, dict) and "data" in users:
+                            users = users.get("data") or []
+                        users_df = pd.DataFrame(users)
+                else:
+                    st.error(f"Failed to load users: {err}")
+                    users_df = pd.DataFrame()
+            else:
+                users = data or []
+                if isinstance(users, dict) and "data" in users:
+                    users = users.get("data") or []
+                users_df = pd.DataFrame(users)
+
+            if not users_df.empty and "created_at" in users_df.columns:
+                users_df["created_at"] = pd.to_datetime(users_df["created_at"], utc=True)
+        except Exception as e:
+            st.error(f"Exception fetching users: {e}")
+            users_df = pd.DataFrame()
+
+        # Metrics
+        col_a, col_b, col_c = st.columns(3)
+        total_users = len(users_df)
+        adults = int(users_df["is_adult"].sum()) if (not users_df.empty and "is_adult" in users_df.columns) else 0
+        non_adults = total_users - adults
+
+        col_a.metric("Total users", total_users)
+        col_b.metric("18+ users", adults)
+        col_c.metric("Under 18 (reported)", non_adults)
+
+        st.subheader("Recent signups")
+        if users_df.empty:
+            st.info("No user records found yet.")
+        else:
+            recent_cols = [c for c in ["email", "auth_user_id", "is_adult", "created_at"] if c in users_df.columns]
+            st.dataframe(users_df.loc[:, recent_cols].head(20))
+
+            st.subheader("Latest ID preview")
+            if "id_image_public_url" in users_df.columns:
+                latest_with_image = users_df[users_df["id_image_public_url"].notnull() & (users_df["id_image_public_url"] != "")]
+            elif "id_image_path" in users_df.columns:
+                latest_with_image = users_df[users_df["id_image_path"].notnull() & (users_df["id_image_path"] != "")]
+            else:
+                latest_with_image = pd.DataFrame()
+
+            if not latest_with_image.empty:
+                if "id_image_public_url" in latest_with_image.columns:
+                    latest_url = latest_with_image.iloc[0]["id_image_public_url"]
+                    try:
+                        st.image(latest_url, caption="Latest uploaded ID (public URL)", use_column_width=True)
+                    except Exception:
+                        st.text("Could not load latest image via public URL.")
+                else:
+                    try:
+                        row = latest_with_image.iloc[0]
+                        path = row.get("id_image_path")
+                        if path:
+                            url_res = supabase.storage.from_(BUCKET_NAME).get_public_url(path)
+                            oku, datu, erru = _parse_supabase_response(url_res)
+                            if oku:
+                                if isinstance(datu, dict):
+                                    pub = datu.get("publicUrl") or datu.get("publicURL") or datu.get("public_url") or str(datu)
+                                else:
+                                    pub = str(datu)
+                                st.image(pub, caption="Latest uploaded ID (constructed URL)", use_column_width=True)
+                            else:
+                                st.text("Could not construct public URL for latest image.")
+                        else:
+                            st.text("No image path available for preview.")
+                    except Exception:
+                        st.text("Could not preview the latest image.")
+
+else:
+    st.info("Unknown page. Returning to signup.")
+    go_to_page("signup")
 
 st.markdown("---")
 st.caption(
@@ -568,14 +635,13 @@ st.caption(
     "Enable RLS and policies in production and limit access to service keys."
 )
 
-# Optional: small admin panel to clear test users (dangerous in prod) - protected by a simple text key
+# Optional admin expander
 with st.expander("Admin (dangerous) - Remove test users"):
     admin_key = st.text_input("Admin key", type="password")
     if st.button("Delete all test users (email contains 'test')"):
         if admin_key == ADMIN_KEY and ADMIN_KEY != "":
             try:
                 del_res = supabase.table("users").delete().ilike("email", "%test%").execute()
-                # robust parse
                 ok, data, err = _parse_supabase_response(del_res)
                 if not ok:
                     st.error(f"Deletion failed: {err}")
