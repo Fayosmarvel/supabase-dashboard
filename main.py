@@ -39,15 +39,74 @@ def is_valid_email(email: str) -> bool:
 
 def _parse_supabase_response(res):
     """
-    Normalize different supabase client responses into (ok: bool, data, error_message).
+    Normalize many supabase client response shapes into (ok: bool, data, error_message).
+    Handles:
+     - objects with .data/.error
+     - objects with .user/.session/.access_token (AuthResponse-like)
+     - objects with .status_code/.json()
+     - plain dicts
     """
     try:
+        # None
+        if res is None:
+            return False, None, "No response (None)"
+
+        # If already a plain dict
+        if isinstance(res, dict):
+            data = res.get("data") or res.get("body") or None
+            error = res.get("error") or res.get("message") or None
+            status = res.get("status_code") or res.get("status")
+            ok = True
+            if status:
+                try:
+                    ok = 200 <= int(status) < 300
+                except Exception:
+                    ok = False
+            else:
+                ok = error is None
+            return ok, data, error
+
+        # If object has .data or .error attributes (common)
         if hasattr(res, "data") or hasattr(res, "error"):
             data = getattr(res, "data", None)
             error = getattr(res, "error", None)
             ok = (error is None)
             return ok, data, error
 
+        # If object looks like an AuthResponse (has user/session/access_token)
+        if hasattr(res, "user") or hasattr(res, "session") or hasattr(res, "access_token") or hasattr(res, "refresh_token"):
+            payload = {}
+            try:
+                if hasattr(res, "user"):
+                    payload["user"] = getattr(res, "user")
+                # some clients put session or tokens on the response
+                if hasattr(res, "session"):
+                    payload["session"] = getattr(res, "session")
+                else:
+                    # build a session-like dict if tokens exist
+                    sess = {}
+                    if hasattr(res, "access_token"):
+                        sess["access_token"] = getattr(res, "access_token")
+                    if hasattr(res, "refresh_token"):
+                        sess["refresh_token"] = getattr(res, "refresh_token")
+                    if hasattr(res, "expires_in"):
+                        sess["expires_in"] = getattr(res, "expires_in")
+                    if sess:
+                        payload["session"] = sess
+            except Exception:
+                # best-effort — ignore detailed faults
+                pass
+            # Consider this a success if we have at least user or session
+            ok = bool(payload.get("user") or payload.get("session"))
+            # Also attempt to surface any error property
+            err = None
+            if hasattr(res, "error"):
+                err = getattr(res, "error")
+            if hasattr(res, "message") and not err:
+                err = getattr(res, "message")
+            return ok, payload or None, err
+
+        # If object has status_code / data / json (http-like)
         if hasattr(res, "status_code"):
             status = getattr(res, "status_code", None)
             data = None
@@ -74,20 +133,7 @@ def _parse_supabase_response(res):
                 error = f"HTTP {status}"
             return ok, data, error
 
-        if isinstance(res, dict):
-            data = res.get("data") or res.get("body") or None
-            error = res.get("error") or res.get("message") or None
-            status = res.get("status_code") or res.get("status")
-            ok = True
-            if status:
-                try:
-                    ok = 200 <= int(status) < 300
-                except Exception:
-                    ok = False
-            else:
-                ok = error is None
-            return ok, data, error
-
+        # Fallback: unknown type
         return False, None, f"Unexpected response type: {type(res).__name__}"
     except Exception as exc:
         return False, None, f"Exception while parsing response: {exc}"
@@ -157,31 +203,9 @@ def create_auth_user(email: str, password: str):
     """
     Create a Supabase Auth user using sign_up.
     Returns (ok: bool, payload_or_error).
-    Behavior:
-      - If the email already exists, returns a clear message instead of repeatedly attempting sign_up.
-      - Tries safe call shapes: dict-style and keyword-args (avoids the problematic positional call).
     """
-    # 0) Quick validation
-    if not email or not password:
-        return False, "Email and password are required."
-
-    # 1) If user already exists, short-circuit with helpful guidance
-    try:
-        exists, reason = check_user_exists(email)
-        if exists:
-            # Provide actionable guidance instead of attempting sign_up again
-            msg = (
-                "User already registered. If this is your account, please use 'Forgot password' to reset the password "
-                "or click 'Resend confirmation email' if you haven't confirmed your address yet."
-            )
-            return False, msg
-    except Exception:
-        # If the existence check fails, continue but keep a note
-        pass
-
     attempts = []
-
-    # Attempt 1: dict-style (preferred)
+    # Attempt 1: dict-style
     try:
         res = supabase.auth.sign_up({"email": email, "password": password})
         ok, data, err = _parse_supabase_response(res)
@@ -191,21 +215,18 @@ def create_auth_user(email: str, password: str):
     except Exception as e:
         attempts.append(("dict-style-exception", str(e)))
 
-    # Attempt 2: keyword-args (some clients accept named args)
+    # Attempt 2: positional args
     try:
-        # use keyword args to avoid positional-argument arity problems
-        res = supabase.auth.sign_up(email=email, password=password)
-        ok, data, err = _parse_supabase_response(res)
-        if ok:
-            return True, data
-        attempts.append(("keyword-args", err or data))
-    except TypeError as te:
-        # If the client truly doesn't support keywords, record and continue
-        attempts.append(("keyword-args-typeerror", str(te)))
+        if hasattr(supabase.auth, "sign_up") and callable(supabase.auth.sign_up):
+            res = supabase.auth.sign_up(email, password)
+            ok, data, err = _parse_supabase_response(res)
+            if ok:
+                return True, data
+            attempts.append(("positional", err or data))
     except Exception as e:
-        attempts.append(("keyword-args-exception", str(e)))
+        attempts.append(("positional-exception", str(e)))
 
-    # Attempt 3: Some GoTrue clients offer a single-dict with options
+    # Attempt 3: single-dict (email-only)
     try:
         res = supabase.auth.sign_up({"email": email})
         ok, data, err = _parse_supabase_response(res)
@@ -215,7 +236,7 @@ def create_auth_user(email: str, password: str):
     except Exception as e:
         attempts.append(("dict-email-only-exception", str(e)))
 
-    # If we have a last 'res' object containing user/session attrs, try to extract
+    # Try to extract user/session if last res had those attributes
     try:
         if 'res' in locals() and (hasattr(res, "user") or hasattr(res, "session")):
             payload = {}
@@ -257,11 +278,7 @@ def create_auth_user(email: str, password: str):
 def sign_in_user(email: str, password: str):
     """
     Robust sign-in wrapper. Returns (ok: bool, payload_or_error_str).
-
-    - Calls modern sign_in_with_password when available.
-    - On failure, checks whether the email exists and whether email is confirmed,
-      and returns actionable suggestions (reset password / confirm email).
-    - If DEBUG is enabled in st.secrets (DEBUG="1"), raw responses are also shown.
+    Handles modern sign_in_with_password and AuthResponse shapes.
     """
     attempts = []
 
@@ -272,10 +289,10 @@ def sign_in_user(email: str, password: str):
             st.write(f"DEBUG sign-in raw ({label}):", repr(res))
             st.write("DEBUG parsed:", ok, data, err)
         if ok:
-            # prefer to return user/session info if present
+            # If data is a dict containing user/session, return it
             if isinstance(data, dict) and ("user" in data or "session" in data):
                 return True, data
-            # sometimes res has attributes
+            # If res itself contains user/session attributes, parse again (best-effort)
             try:
                 payload = {}
                 if hasattr(res, "user"):
@@ -286,11 +303,13 @@ def sign_in_user(email: str, password: str):
                     return True, payload
             except Exception:
                 pass
+            # Otherwise return whatever parsed as success
             return True, data or "Signed in (no user/session payload found)"
         else:
+            # If err present, return it; otherwise give a default
             return False, str(err) if err else f"Sign-in failed ({label}) - no error message."
 
-    # 1) Modern call
+    # 1) Preferred: sign_in_with_password
     try:
         if hasattr(supabase.auth, "sign_in_with_password"):
             res = supabase.auth.sign_in_with_password({"email": email, "password": password})
@@ -301,9 +320,11 @@ def sign_in_user(email: str, password: str):
         else:
             attempts.append(("sign_in_with_password-missing", "method not available"))
     except Exception as e:
+        # If the SDK raised but returned an AuthResponse-like object (some clients raise custom exceptions),
+        # try to capture that response if available on the exception (best-effort).
         attempts.append(("sign_in_with_password-exception", str(e)))
 
-    # 2) Fallback older shapes (if present)
+    # 2) Fallback older shapes
     try:
         if hasattr(supabase.auth, "sign_in"):
             try:
@@ -319,18 +340,16 @@ def sign_in_user(email: str, password: str):
     except Exception as e:
         attempts.append(("sign_in-dict-ex2", str(e)))
 
-    # All sign-in attempts failed — provide helpful guidance
-    # Check if the user exists and whether they confirmed their email
+    # final guidance: inspect existence and confirmation status
     exists, reason = False, "unknown"
     try:
         exists, reason = check_user_exists(email)
     except Exception:
         exists, reason = False, "check_user_exists failed"
 
-    # try to fetch auth user info to examine confirmation status (best-effort)
+    # Try to see if email is unconfirmed (best-effort)
     email_confirmed = None
     try:
-        # Many clients expose admin or api methods — try both
         auth_user = None
         try:
             auth_user = supabase.auth.api.get_user_by_email(email)
@@ -341,10 +360,8 @@ def sign_in_user(email: str, password: str):
                 auth_user = supabase.auth.admin.get_user_by_email(email)
             except Exception:
                 pass
-        # parse
         ok2, data2, err2 = _parse_supabase_response(auth_user) if auth_user is not None else (False, None, None)
         if ok2 and data2:
-            # data2 might be the user dict or wrapped in 'user'
             u = None
             if isinstance(data2, dict):
                 if data2.get("email"):
@@ -352,29 +369,29 @@ def sign_in_user(email: str, password: str):
                 elif "user" in data2 and isinstance(data2["user"], dict):
                     u = data2["user"]
             if isinstance(u, dict):
-                email_confirmed = bool(u.get("email_confirmed_at") or u.get("confirmed_at") or u.get("email_confirmed"))
+                # check various possible confirmation fields inside user dict
+                email_confirmed = bool(u.get("email_confirmed_at") or u.get("confirmed_at") or u.get("email_confirmed") or u.get("confirmed"))
     except Exception:
         email_confirmed = None
 
     # Compose final friendly message
     msg_parts = []
-    # give raw attempts summary (concise)
     msg_parts.append("Unable to sign in. Reason(s):")
     for k, v in attempts:
         msg_parts.append(f"- {k}: {v}")
 
     if exists:
         if email_confirmed is False:
-            msg_parts.append("- Your account exists but the email is not confirmed. Check your inbox for the confirmation email or enable confirmation in Supabase settings.")
+            msg_parts.append("- Your account exists but the email appears not confirmed. Check your inbox for the confirmation email or use 'Resend confirmation'.")
         else:
-            msg_parts.append("- The email exists. Most likely the password is incorrect. Try resetting your password.")
-            msg_parts.append("  You can reset your password from the Supabase dashboard (Auth → Users → Reset password) or implement a 'Forgot password' flow.")
+            msg_parts.append("- The email exists. The password may be incorrect. Try resetting your password (Forgot password).")
+            msg_parts.append("  Reset via Supabase Dashboard (Auth → Users → Reset password) or use the app's reset flow.")
     else:
-        msg_parts.append("- No account found for that email. Create a new account or verify the email address used during signup.")
+        msg_parts.append("- No account found for that email. Create a new account or verify the signup email.")
 
-    # Add a short actionable tip
-    msg_parts.append("If you're testing, you can also create a test user directly in the Supabase dashboard and try logging in with that user's credentials.")
-    final_msg = "\n".join(msg_parts)
+    msg_parts.append("If you're testing, enable DEBUG in Streamlit secrets (DEBUG=\"1\") to see the raw auth response.")
+    final_msg = "
+".join(msg_parts)
     return False, final_msg
 
 
