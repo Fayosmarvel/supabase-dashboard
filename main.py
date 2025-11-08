@@ -28,6 +28,12 @@ except Exception:
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ----------------------------
+# Initialize Streamlit session state
+# ----------------------------
+if "cart" not in st.session_state:
+    st.session_state["cart"] = []
+
+# ----------------------------
 # Helpers
 # ----------------------------
 EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
