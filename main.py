@@ -28,10 +28,16 @@ except Exception:
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ----------------------------
-# Initialize Streamlit session state
+# ✅ Initialize Streamlit session state here
 # ----------------------------
-if "cart" not in st.session_state:
-    st.session_state["cart"] = []
+for key, default_value in {
+    "cart": [],
+    "user": None,
+    "uploaded_files": [],
+    "selected_course": None
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default_value
 
 # ----------------------------
 # Helpers
