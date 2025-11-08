@@ -41,6 +41,7 @@ def _parse_supabase_response(res):
     """
     Normalize many supabase client response shapes into (ok: bool, data, error_message).
     Handles:
+     - plain strings (public URLs returned as str)
      - objects with .data/.error
      - objects with .user/.session/.access_token (AuthResponse-like)
      - objects with .status_code/.json()
@@ -50,6 +51,10 @@ def _parse_supabase_response(res):
         # None
         if res is None:
             return False, None, "No response (None)"
+
+        # If res is a plain string (some SDKs return the public URL as a str)
+        if isinstance(res, str):
+            return True, res, None
 
         # If already a plain dict
         if isinstance(res, dict):
@@ -79,11 +84,9 @@ def _parse_supabase_response(res):
             try:
                 if hasattr(res, "user"):
                     payload["user"] = getattr(res, "user")
-                # some clients put session or tokens on the response
                 if hasattr(res, "session"):
                     payload["session"] = getattr(res, "session")
                 else:
-                    # build a session-like dict if tokens exist
                     sess = {}
                     if hasattr(res, "access_token"):
                         sess["access_token"] = getattr(res, "access_token")
@@ -94,11 +97,8 @@ def _parse_supabase_response(res):
                     if sess:
                         payload["session"] = sess
             except Exception:
-                # best-effort — ignore detailed faults
                 pass
-            # Consider this a success if we have at least user or session
             ok = bool(payload.get("user") or payload.get("session"))
-            # Also attempt to surface any error property
             err = None
             if hasattr(res, "error"):
                 err = getattr(res, "error")
@@ -215,7 +215,7 @@ def create_auth_user(email: str, password: str):
     except Exception as e:
         attempts.append(("dict-style-exception", str(e)))
 
-    # Attempt 2: positional args
+    # Attempt 2: positional args (some clients)
     try:
         if hasattr(supabase.auth, "sign_up") and callable(supabase.auth.sign_up):
             res = supabase.auth.sign_up(email, password)
@@ -320,8 +320,6 @@ def sign_in_user(email: str, password: str):
         else:
             attempts.append(("sign_in_with_password-missing", "method not available"))
     except Exception as e:
-        # If the SDK raised but returned an AuthResponse-like object (some clients raise custom exceptions),
-        # try to capture that response if available on the exception (best-effort).
         attempts.append(("sign_in_with_password-exception", str(e)))
 
     # 2) Fallback older shapes
@@ -369,7 +367,6 @@ def sign_in_user(email: str, password: str):
                 elif "user" in data2 and isinstance(data2["user"], dict):
                     u = data2["user"]
             if isinstance(u, dict):
-                # check various possible confirmation fields inside user dict
                 email_confirmed = bool(u.get("email_confirmed_at") or u.get("confirmed_at") or u.get("email_confirmed") or u.get("confirmed"))
     except Exception:
         email_confirmed = None
@@ -392,6 +389,7 @@ def sign_in_user(email: str, password: str):
     msg_parts.append("If you're testing, enable DEBUG in Streamlit secrets (DEBUG=\"1\") to see the raw auth response.")
     final_msg = "\n".join(msg_parts)
     return False, final_msg
+
 
 # ----------------------------
 # Password reset & resend confirmation helpers
@@ -422,12 +420,10 @@ def send_password_reset(email: str):
     calls.append(("auth.reset_password_for_email", lambda: supabase.auth.reset_password_for_email(email)))
     calls.append(("auth.send_reset_password_email", lambda: supabase.auth.send_reset_password_email(email)))
     calls.append(("auth.admin.reset_user_password", lambda: supabase.auth.admin.reset_user_password(email)))
-    # Try a generic rpc/endpoint if project exposes it (best-effort)
     calls.append(("rpc.reset_password", lambda: supabase.rpc("reset_password", {"email": email})))
     ok, msg, data = _try_calls(calls)
     if ok:
         return True, "Password reset requested — check your email for instructions."
-    # Fall back message includes reason
     return False, f"Could not request password reset. {msg}"
 
 
@@ -448,9 +444,12 @@ def resend_confirmation(email: str):
 
 
 # ----------------------------
-# Upload helpers (unchanged)
+# Upload helpers (robust)
 # ----------------------------
 def upload_id_image_to_storage(uploaded_file, path: str):
+    """
+    Upload id image and return (ok, public_url_or_error_str).
+    """
     attempts = []
     try:
         file_bytes = uploaded_file.getvalue()
@@ -467,56 +466,52 @@ def upload_id_image_to_storage(uploaded_file, path: str):
         try:
             res = call_fn()
             last_res = res
-            inner_path = None
-            try:
-                if hasattr(res, "path") and getattr(res, "path"):
-                    inner_path = getattr(res, "path")
-                elif hasattr(res, "full_path") and getattr(res, "full_path"):
-                    fp = getattr(res, "full_path")
-                    prefix = f"{BUCKET_NAME}/"
-                    if isinstance(fp, str) and fp.startswith(prefix):
-                        inner_path = fp[len(prefix):]
-                    else:
-                        inner_path = fp
-            except Exception:
-                inner_path = None
 
-            if inner_path:
+            # If upload response contains path info, try to extract it
+            try:
+                ok, data, err = _parse_supabase_response(res)
+            except Exception:
+                ok, data, err = False, None, "Could not parse upload response"
+
+            # If upload returned dict with path or key, use it to get public url
+            p = None
+            if ok and isinstance(data, dict):
+                p = data.get("path") or data.get("full_path") or data.get("fullPath") or data.get("key")
+            # Some SDKs return strings/objects we can't parse - we still try to use the requested path param
+            if not p:
+                # try to compute path from known pattern where res.path/full_path exist
                 try:
-                    url_res = supabase.storage.from_(BUCKET_NAME).get_public_url(inner_path)
-                    ok2, data2, err2 = _parse_supabase_response(url_res)
-                    if ok2:
-                        if isinstance(data2, dict):
-                            return True, data2.get("publicUrl") or data2.get("publicURL") or data2.get("public_url") or str(data2)
-                        return True, str(data2)
+                    if hasattr(res, "path") and getattr(res, "path"):
+                        p = getattr(res, "path")
+                    elif hasattr(res, "full_path") and getattr(res, "full_path"):
+                        p = getattr(res, "full_path")
+                except Exception:
+                    p = None
+
+            # If we have a path inside bucket, ensure it's the key (no bucket prefix)
+            if p:
+                if isinstance(p, str):
+                    prefix = f"{BUCKET_NAME}/"
+                    if p.startswith(prefix):
+                        p = p[len(prefix):]
+
+                try:
+                    url_res = supabase.storage.from_(BUCKET_NAME).get_public_url(p)
+                    oku, datu, erru = _parse_supabase_response(url_res)
+                    if oku:
+                        # datu may be dict or str
+                        if isinstance(datu, dict):
+                            return True, datu.get("publicUrl") or datu.get("publicURL") or datu.get("public_url") or str(datu)
+                        return True, str(datu)
                     else:
-                        return True, f"Upload succeeded; could not obtain public URL: {err2 or data2}"
+                        # upload succeeded but could not obtain public URL
+                        return True, f"Upload succeeded; could not obtain public URL: {erru or datu}"
                 except Exception as e:
                     return True, f"Upload succeeded; exception obtaining public URL: {e}"
 
-            ok, data, err = _parse_supabase_response(res)
-            attempts.append((desc, "parsed_ok" if ok else f"parsed_err: {err}"))
+            # Last resort: if parser says ok and data was present but no path, return a textual success
             if ok:
-                try:
-                    p = None
-                    if isinstance(data, dict):
-                        p = data.get("path") or data.get("full_path") or data.get("fullPath") or data.get("key")
-                    if p:
-                        prefix = f"{BUCKET_NAME}/"
-                        if isinstance(p, str) and p.startswith(prefix):
-                            p = p[len(prefix):]
-                        url_res = supabase.storage.from_(BUCKET_NAME).get_public_url(p)
-                        ok2, data2, err2 = _parse_supabase_response(url_res)
-                        if ok2:
-                            if isinstance(data2, dict):
-                                return True, data2.get("publicUrl") or data2.get("publicURL") or data2.get("public_url") or str(data2)
-                            return True, str(data2)
-                        else:
-                            return True, f"Upload succeeded; get_public_url failed: {err2 or data2}"
-                    else:
-                        return True, f"Upload seemed to succeed. Response: {data}"
-                except Exception as e:
-                    return True, f"Upload seemed to succeed; exception processing response: {e}"
+                return True, f"Upload seemed to succeed. Response: {data}"
 
         except Exception as e:
             attempts.append((desc, f"exception: {e}"))
@@ -564,6 +559,8 @@ if "user_email" not in st.session_state:
     st.session_state["user_email"] = None
 if "message" not in st.session_state:
     st.session_state["message"] = ""
+if "course_images" not in st.session_state:
+    st.session_state["course_images"] = {}  # course_id -> public_url
 
 
 def do_logout():
@@ -623,18 +620,17 @@ st.markdown(
 # Sidebar: logo + nav
 with st.sidebar:
     local_logo = os.path.join(os.getcwd(), "assets", "logo.png")
+    fallback = "/mnt/data/ChatGPT Image Nov 7, 2025, 12_11_34 PM.png"
     if os.path.exists(local_logo):
         st.image(local_logo, use_column_width=True, output_format="PNG")
+    elif os.path.exists(fallback):
+        st.image(fallback, use_column_width=True, output_format="PNG")
     else:
-        fallback = "/mnt/data/ChatGPT Image Nov 7, 2025, 12_11_34 PM.png"
-        if os.path.exists(fallback):
-            st.image(fallback, use_column_width=True, output_format="PNG")
-        else:
-            st.markdown("**Fayos Marvel Tech Company**")
+        st.markdown("**Fayos Marvel Tech Company**")
 
     st.markdown("---")
     if st.session_state.get("logged_in"):
-        page_choice = st.radio("Menu", ["Dashboard", "Settings", "Account", "Logout"], index=0)
+        page_choice = st.radio("Menu", ["Dashboard", "Settings", "Account", "Transactions", "Logout"], index=0)
     else:
         page_choice = st.radio("Menu", ["Home", "Signup", "Login"], index=0)
 
@@ -651,9 +647,10 @@ with st.sidebar:
         st.experimental_set_query_params(page="settings")
     elif page_choice == "Account":
         st.experimental_set_query_params(page="account")
+    elif page_choice == "Transactions":
+        st.experimental_set_query_params(page="transactions")
     elif page_choice == "Logout":
         do_logout()
-        # go_to_page will handle rerun/exit if needed
         go_to_page("signup")
 
 
@@ -678,7 +675,6 @@ with left_col:
         unsafe_allow_html=True,
     )
 with right_col:
-    # small decorative image or logo repeat
     if os.path.exists(local_logo):
         st.image(local_logo, use_column_width=True)
     elif os.path.exists(fallback):
@@ -691,7 +687,7 @@ if st.session_state.get("message"):
 page = current_page()
 
 # ----------------------------
-# Pages: signup / login / dashboard / settings / account
+# Pages: signup / login / dashboard / settings / account / transactions
 # ----------------------------
 if page == "signup":
     col1, col2 = st.columns([1, 1])
@@ -827,12 +823,7 @@ elif page == "login":
         go_to_page("signup")
 
 # ----------------------------
-# Dashboard: courses, cart, payments, transactions, notifications
-# Replaced existing dashboard implementation with the enriched dashboard UI
-# ----------------------------
-# ----------------------------
 # Dashboard (top-tab layout) with storage-backed course images
-# Replace existing `elif page == "dashboard":` block with this.
 # ----------------------------
 elif page == "dashboard":
     if not st.session_state.get("logged_in"):
@@ -899,12 +890,7 @@ elif page == "dashboard":
 
         courses = _generate_courses()
 
-        # session state init
-        if "cart" not in st.session_state:
-            st.session_state["cart"] = []
-        if "course_images" not in st.session_state:
-            # course_id -> public_url (persisted)
-            st.session_state["course_images"] = {}
+        # session state init for cart already handled above
 
         # ---------- Home tab ----------
         with tab_home:
@@ -938,21 +924,56 @@ elif page == "dashboard":
                             path = f"course_images/course_{chosen_id}_{uuid4().hex}.{ext}"
 
                             # Upload (best-effort)
+                            up_res = None
+                            upload_ok = False
+                            upload_err = None
+                            data_u = None
                             try:
-                                supabase.storage.from_(BUCKET_NAME).upload(path, file_bytes)
+                                up_res = supabase.storage.from_(BUCKET_NAME).upload(path, file_bytes)
+                                ok_u, data_u, err_u = _parse_supabase_response(up_res)
+                                upload_ok = ok_u
+                                upload_err = err_u
                             except Exception as e_upload:
-                                # some SDKs may complain if file exists or require different args; still try to proceed to get_public_url
-                                st.warning(f"Upload attempt returned: {e_upload}")
+                                upload_err = str(e_upload)
 
                             # Get public URL
-                            url_res = supabase.storage.from_(BUCKET_NAME).get_public_url(path)
-                            oku, datu, erru = _parse_supabase_response(url_res)
-                            if oku:
-                                pub = datu.get("publicUrl") if isinstance(datu, dict) else str(datu)
+                            url_res = None
+                            pub = None
+                            url_ok = False
+                            url_err = None
+                            datu = None
+                            try:
+                                url_res = supabase.storage.from_(BUCKET_NAME).get_public_url(path)
+                                oku, datu, erru = _parse_supabase_response(url_res)
+                                url_ok = oku
+                                url_err = erru
+                                if oku:
+                                    if isinstance(datu, dict):
+                                        pub = datu.get("publicUrl") or datu.get("publicURL") or datu.get("public_url")
+                                    else:
+                                        pub = str(datu)
+                                else:
+                                    pub = None
+                            except Exception as e:
+                                url_err = str(e)
+
+                            # DEBUG panel (visible when DEBUG secret is set)
+                            if st.secrets.get("DEBUG", "") == "1":
+                                st.markdown("**DEBUG: Upload response (raw)**")
+                                st.write(repr(up_res))
+                                st.markdown("**DEBUG: Parsed upload response**")
+                                st.write({"ok": upload_ok, "data": data_u, "error": upload_err})
+                                st.markdown("**DEBUG: get_public_url raw response**")
+                                st.write(repr(url_res))
+                                st.markdown("**DEBUG: Parsed get_public_url**")
+                                st.write({"ok": url_ok, "public_url": pub, "error": url_err})
+
+                            if url_ok and pub:
                                 st.session_state["course_images"][str(chosen_id)] = pub
                                 st.success(f"Uploaded and saved image for course {chosen_id}")
                             else:
-                                st.error(f"Could not get public URL: {erru}")
+                                st.error(f"Could not get public URL: {url_err or upload_err or 'unknown error'}")
+
                         except Exception as e:
                             st.error(f"Error uploading image: {e}")
 
@@ -1063,7 +1084,7 @@ elif page == "dashboard":
                     st.session_state["theme"] = "dark"
                     go_to_page("dashboard")
 
-        # ---------- Transactions quick tab ----------
+        # ---------- Transactions tab (quick) ----------
         with tab_tx:
             st.subheader("Transactions")
             st.info("Use the Transactions page for a full list and CSV export.")
@@ -1099,37 +1120,6 @@ elif page == "dashboard":
                 except Exception as e:
                     st.error(f"Error recording purchase: {e}")
 
-elif page == "settings":
-    if not st.session_state.get("logged_in"):
-        st.warning("Please log in to access settings.")
-        go_to_page("login")
-    else:
-        st.header("Settings")
-        st.write("Update app settings and preferences here.")
-        with st.form("settings_form"):
-            display_name = st.text_input("Display name", value=st.session_state.get("user_email") or "")
-            save = st.form_submit_button("Save settings")
-        if save:
-            try:
-                res = supabase.table("users").update({"display_name": display_name}).eq("email", st.session_state.get("user_email")).execute()
-                ok, data, err = _parse_supabase_response(res)
-                if ok:
-                    st.success("Settings updated.")
-                else:
-                    st.error(f"Could not save settings: {err}")
-            except Exception as e:
-                st.error(f"Error saving settings: {e}")
-
-elif page == "account":
-    if not st.session_state.get("logged_in"):
-        st.warning("Please log in to view account.")
-        go_to_page("login")
-    else:
-        st.header("Account")
-        st.write(f"Signed in as: **{st.session_state.get('user_email')}**")
-        if st.button("Logout"):
-            do_logout()
-
 # ----------------------------
 # Transactions page (full list + CSV export)
 # ----------------------------
@@ -1160,6 +1150,40 @@ elif page == "transactions":
                     st.download_button("Export CSV", csv, file_name="transactions.csv", mime="text/csv")
         except Exception as e:
             st.error(f"Error loading transactions: {e}")
+
+# ----------------------------
+# Settings / Account pages
+# ----------------------------
+elif page == "settings":
+    if not st.session_state.get("logged_in"):
+        st.warning("Please log in to access settings.")
+        go_to_page("login")
+    else:
+        st.header("Settings")
+        st.write("Update app settings and preferences here.")
+        with st.form("settings_form"):
+            display_name = st.text_input("Display name", value=st.session_state.get("user_email") or "")
+            save = st.form_submit_button("Save settings")
+        if save:
+            try:
+                res = supabase.table("users").update({"display_name": display_name}).eq("email", st.session_state.get("user_email")).execute()
+                ok, data, err = _parse_supabase_response(res)
+                if ok:
+                    st.success("Settings updated.")
+                else:
+                    st.error(f"Could not save settings: {err}")
+            except Exception as e:
+                st.error(f"Error saving settings: {e}")
+
+elif page == "account":
+    if not st.session_state.get("logged_in"):
+        st.warning("Please log in to view account.")
+        go_to_page("login")
+    else:
+        st.header("Account")
+        st.write(f"Signed in as: **{st.session_state.get('user_email')}**")
+        if st.button("Logout"):
+            do_logout()
 
 else:
     st.info("Unknown page. Returning to signup.")
