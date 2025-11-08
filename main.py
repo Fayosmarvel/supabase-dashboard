@@ -390,8 +390,8 @@ def sign_in_user(email: str, password: str):
         msg_parts.append("- No account found for that email. Create a new account or verify the signup email.")
 
     msg_parts.append("If you're testing, enable DEBUG in Streamlit secrets (DEBUG=\"1\") to see the raw auth response.")
-final_msg = "\n".join(msg_parts)
-return False, final_msg
+    final_msg = "\n".join(msg_parts)
+    return False, final_msg
 
 # ----------------------------
 # Password reset & resend confirmation helpers
